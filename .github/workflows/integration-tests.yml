@@ -59,7 +59,7 @@ jobs:
 
       - name: Update PATH
         run: |
-          echo "PATH=${HOME}/.local/bin:${PATH}" >> "${GITHUB_ENV}"
+          echo "PATH=${S_HOME}/.local/bin:${PATH}" >> "${GITHUB_ENV}"
 
       - name: Check pre-commit
         if: ${{ matrix.runner != 'macos-10.15' }}

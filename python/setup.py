@@ -163,7 +163,7 @@ class CMakeBuild(build_ext):
 
     def build_extension(self, ext):
         lit_dir = shutil.which('lit')
-        user_home = os.getenv("HOME") or os.getenv("USERPROFILE") or \
+        user_home = os.getenv("S_HOME") or os.getenv("USERPROFILE") or \
             os.getenv("HOMEPATH") or None
         if not user_home:
             raise RuntimeError("Could not find user home directory")

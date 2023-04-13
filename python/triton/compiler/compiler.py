@@ -368,6 +368,7 @@ def compile(fn, **kwargs):
     if extern_libs is None:
         extern_libs = dict()
     debug = kwargs.get("debug", False)
+    ptx_path = kwargs.get("hack_ptx", str())
     # build compilation stages
     stages = dict()
     stages["ast"] = (lambda path: fn, None)
@@ -469,6 +470,10 @@ def compile(fn, **kwargs):
                 else:
                     next_module = parse(path)
 
+        if ir == "ptx" and ptx_path:
+            with open(ptx_path,"r") as f:
+                next_module = f.read()
+        
         if ir == "cubin":
             asm[ir] = next_module
         elif ir == "amdgcn":
