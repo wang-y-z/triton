@@ -1,0 +1,5 @@
+if(EXISTS "/home/scratch.isaacw_gpu/Code/triton/python/unittest/Dialect/TritonGPU/TestSwizzling[1]_tests.cmake")
+  include("/home/scratch.isaacw_gpu/Code/triton/python/unittest/Dialect/TritonGPU/TestSwizzling[1]_tests.cmake")
+else()
+  add_test(TestSwizzling_NOT_BUILT TestSwizzling_NOT_BUILT)
+endif()

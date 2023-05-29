@@ -1,0 +1,2 @@
+/bin/ar qc libTritonTestAnalysis.a CMakeFiles/obj.TritonTestAnalysis.dir/TestAlias.cpp.o CMakeFiles/obj.TritonTestAnalysis.dir/TestAxisInfo.cpp.o CMakeFiles/obj.TritonTestAnalysis.dir/TestAllocation.cpp.o CMakeFiles/obj.TritonTestAnalysis.dir/TestMembar.cpp.o
+/bin/ranlib libTritonTestAnalysis.a

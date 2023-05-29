@@ -1,0 +1,2 @@
+/bin/ar qc libTritonGPUIR.a CMakeFiles/obj.TritonGPUIR.dir/Dialect.cpp.o CMakeFiles/obj.TritonGPUIR.dir/Traits.cpp.o
+/bin/ranlib libTritonGPUIR.a

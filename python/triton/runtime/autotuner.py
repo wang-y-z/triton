@@ -6,7 +6,7 @@ from typing import Dict
 
 from ..testing import do_bench
 from .jit import KernelInterface
-
+import copy
 
 class OutOfResources(Exception):
     def __init__(self, required, limit, name):
@@ -75,6 +75,7 @@ class Autotuner(KernelInterface):
             if config.pre_hook:
                 config.pre_hook(self.nargs)
             self.hook(args)
+            # breakpoint()
             self.fn.run(*args, num_warps=config.num_warps, num_stages=config.num_stages, **current)
         try:
             return do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
@@ -91,11 +92,14 @@ class Autotuner(KernelInterface):
                 if name in all_args:
                     _args.append(all_args[name])
             key = tuple(_args[i] for i in self.key_idx)
+            # breakpoint()
             if key not in self.cache:
+                bench_args = copy.deepcopy(args)
                 # prune configs
                 pruned_configs = self.prune_configs(kwargs)
                 bench_start = time.time()
-                timings = {config: self._bench(*args, config=config, **kwargs)
+                # breakpoint()
+                timings = {config: self._bench(*bench_args, config=config, **kwargs)
                            for config in pruned_configs}
                 bench_end = time.time()
                 sorted_configs = sorted(timings.keys(), key=lambda x: timings[x][1])
@@ -110,19 +114,21 @@ class Autotuner(KernelInterface):
                     configs_res += str(timings[config][1])
                     configs_res += "\n"
                 print("|#| =====================")
-                print("|#| configs bench : \n", configs_res)
+                print("|#| [configs bench]", configs_res)
                 self.bench_time = bench_end - bench_start
                 print("|#| bench_time", self.bench_time)
                 print("|#| =====================")
                 self.cache[key] = builtins.min(timings, key=timings.get)
                 self.hook(args)
                 self.configs_timings = timings
+            # breakpoint()
             config = self.cache[key]
         else:
             config = self.configs[0]
         self.best_config = config
         if config.pre_hook is not None:
             config.pre_hook(self.nargs)
+        # breakpoint()
         return self.fn.run(*args, num_warps=config.num_warps, num_stages=config.num_stages, **kwargs, **config.kwargs)
 
     def prune_configs(self, kwargs):

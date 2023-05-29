@@ -1,0 +1,2 @@
+/bin/ar qc libTritonToTritonGPU.a CMakeFiles/obj.TritonToTritonGPU.dir/TritonToTritonGPUPass.cpp.o
+/bin/ranlib libTritonToTritonGPU.a

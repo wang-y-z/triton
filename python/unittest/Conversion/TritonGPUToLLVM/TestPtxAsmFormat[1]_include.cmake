@@ -1,0 +1,5 @@
+if(EXISTS "/home/scratch.isaacw_gpu/Code/triton/python/unittest/Conversion/TritonGPUToLLVM/TestPtxAsmFormat[1]_tests.cmake")
+  include("/home/scratch.isaacw_gpu/Code/triton/python/unittest/Conversion/TritonGPUToLLVM/TestPtxAsmFormat[1]_tests.cmake")
+else()
+  add_test(TestPtxAsmFormat_NOT_BUILT TestPtxAsmFormat_NOT_BUILT)
+endif()

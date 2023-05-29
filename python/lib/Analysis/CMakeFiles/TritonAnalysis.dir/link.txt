@@ -1,0 +1,2 @@
+/bin/ar qc libTritonAnalysis.a CMakeFiles/obj.TritonAnalysis.dir/AxisInfo.cpp.o CMakeFiles/obj.TritonAnalysis.dir/Allocation.cpp.o CMakeFiles/obj.TritonAnalysis.dir/Membar.cpp.o CMakeFiles/obj.TritonAnalysis.dir/Alias.cpp.o CMakeFiles/obj.TritonAnalysis.dir/Utility.cpp.o
+/bin/ranlib libTritonAnalysis.a

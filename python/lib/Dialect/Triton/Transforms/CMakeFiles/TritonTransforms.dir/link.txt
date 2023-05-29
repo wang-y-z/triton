@@ -1,0 +1,2 @@
+/bin/ar qc libTritonTransforms.a CMakeFiles/obj.TritonTransforms.dir/Combine.cpp.o
+/bin/ranlib libTritonTransforms.a

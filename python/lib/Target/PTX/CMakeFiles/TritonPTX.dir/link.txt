@@ -1,0 +1,2 @@
+/bin/ar qc libTritonPTX.a CMakeFiles/obj.TritonPTX.dir/PTXTranslation.cpp.o
+/bin/ranlib libTritonPTX.a

@@ -1,0 +1,2 @@
+/bin/ar qc libTritonLLVMIR.a CMakeFiles/obj.TritonLLVMIR.dir/LLVMIRTranslation.cpp.o
+/bin/ranlib libTritonLLVMIR.a

@@ -1,0 +1,2 @@
+/bin/ar qc libTritonIR.a CMakeFiles/obj.TritonIR.dir/Interfaces.cpp.o CMakeFiles/obj.TritonIR.dir/Dialect.cpp.o CMakeFiles/obj.TritonIR.dir/Ops.cpp.o CMakeFiles/obj.TritonIR.dir/Types.cpp.o CMakeFiles/obj.TritonIR.dir/Traits.cpp.o
+/bin/ranlib libTritonIR.a
