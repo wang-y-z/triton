@@ -656,7 +656,7 @@ def bitcast(input: tl.tensor,
     src_bits = src_sca_ty.primitive_bitwidth
     dst_bits = dst_sca_ty.primitive_bitwidth
     if src_bits != dst_bits:
-        raise ValueError("Cannot bitcast data-type of size " + str(src_bits) + "to "
+        raise ValueError("Cannot bitcast data-type of size " + str(src_bits) + " to "
                          "data-type of size " + str(dst_bits))
     return tl.tensor(builder.create_bitcast(input.handle, dst_ty.to_ir(builder)),
                      dst_ty)
@@ -931,12 +931,13 @@ def _store_block_pointer(ptr, val, mask, boundary_check, cache, eviction, builde
     if mask:
         raise ValueError("`mask` and `other` arguments cannot be specified for loading block pointers")
 
-    # Check same shape
+    # Check same shape and element type
     block_shape = ptr.type.element_ty.get_block_shapes()
     if not val.type.is_block():
         val = broadcast_impl_shape(val, block_shape, builder)
     assert val.type.is_block(), "Value argument must be block type or a scalar"
     assert block_shape == val.type.get_block_shapes(), "Block shape and value shape mismatch"
+    assert ptr.type.element_ty.element_ty == val.type.element_ty, "Block element type and value element type mismatch"
 
     elt_ty = ptr.type.element_ty.element_ty
     assert elt_ty != tl.int1, "`tl.int1` should be rewrited in `tl.make_block_ptr`"
@@ -1235,9 +1236,15 @@ def where(condition: tl.tensor,
 def reduction(
     inputs: Sequence[tl.tensor], axis: int, region_builder_fn, builder: ir.builder
 ) -> Tuple[tl.tensor, ...]:
+    if axis is None:
+        new_inputs = []
+        for i in range(len(inputs)):
+            new_shape = [inputs[i].numel.value]
+            new_inputs.append(view(inputs[i], new_shape, builder))
+        inputs = tuple(new_inputs)
+        axis = 0
     # get result shape
     shape = inputs[0].type.shape
-    print(shape, axis)
     ret_shape = [s for i, s in enumerate(shape) if i != axis]
     for t in inputs:
         assert t.type.shape == shape
@@ -1366,6 +1373,10 @@ def device_print(prefix: str, args: List[tl.tensor], builder: ir.builder) -> tl.
 
 
 def device_assert(cond: tl.tensor, msg: str, file_name: str, func_name, lineno: int, builder: ir.builder) -> tl.tensor:
+    cond_ty = cond.type
+    if not cond_ty.is_block():
+        cond_ty = tl.block_type(cond_ty.scalar, (1,))
+        cond = tl.tensor(builder.create_splat(cond.handle, (1,)), cond_ty)
     return tl.tensor(builder.create_assert(cond.handle, msg, file_name, func_name, lineno), tl.void)
 
 

@@ -5,8 +5,8 @@ using namespace mlir::triton;
 
 using ::mlir::LLVM::shflSync;
 using ::mlir::LLVM::storeShared;
-using ::mlir::triton::gpu::getElemsPerThread;
 using ::mlir::triton::gpu::getOrder;
+using ::mlir::triton::gpu::getTotalElemsPerThread;
 
 struct ReduceOpConversion
     : public ConvertTritonGPUOpToLLVMPattern<triton::ReduceOp> {
@@ -64,7 +64,7 @@ private:
                ConversionPatternRewriter &rewriter) const {
     auto types = op.getInputTypes();
     auto operands = adaptor.getOperands();
-    unsigned srcElems = getElemsPerThread(types[0]);
+    unsigned srcElems = getTotalElemsPerThread(types[0]);
     SmallVector<SmallVector<Value>> srcValues(srcElems);
     for (unsigned i = 0; i < op.getNumOperands(); ++i) {
       auto values = getTypeConverter()->unpackLLElements(loc, operands[i],
@@ -87,6 +87,15 @@ private:
                           Attribute layout, SmallVector<Value> &index,
                           SmallVector<Value> &writeIdx,
                           std::map<int, Value> &ints, unsigned axis) const {
+    if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
+      auto dim = sliceLayout.getDim();
+      assert(dim != axis && "Reduction axis cannot be sliced");
+      auto parentLayout = sliceLayout.getParent();
+      getWriteIndexBasic(rewriter, loc, parentLayout, index, writeIdx, ints,
+                         axis);
+      return;
+    }
+
     writeIdx = index;
     auto sizePerThread = triton::gpu::getSizePerThread(layout);
     Value axisSizePerThread = ints[sizePerThread[axis]];
@@ -100,9 +109,10 @@ private:
       // to map every `axisSizePerThread` to 1 value in smem as:
       // writeIdx[axis] = index[axis] / axisSizePerThread
       writeIdx[axis] = udiv(index[axis], axisSizePerThread);
-    }
-    auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>();
-    if (mmaLayout && mmaLayout.isAmpere()) {
+    } else if (auto mmaLayout = layout.dyn_cast<MmaEncodingAttr>()) {
+      if (!mmaLayout.isAmpere()) {
+        llvm::report_fatal_error("Unsupported layout");
+      }
       if (axis == 0) {
         // Because warpTileSize = [16, 8] and threadsPerWarp = [8, 4], each 8
         // rows in smem would correspond to a warp. The mapping
@@ -113,8 +123,7 @@ private:
         // Same as BlockedEncodingAttr case
         writeIdx[axis] = udiv(index[axis], axisSizePerThread);
       }
-    }
-    if (mmaLayout && !mmaLayout.isAmpere()) {
+    } else {
       llvm::report_fatal_error("Unsupported layout");
     }
   }
@@ -158,7 +167,7 @@ private:
                   elemPtrTys[i]);
     }
 
-    unsigned srcElems = getElemsPerThread(srcTys[0]);
+    unsigned srcElems = getTotalElemsPerThread(srcTys[0]);
     // Emits indices of the original tensor that each thread
     // would own
     auto srcIndices = emitIndices(loc, rewriter, srcLayout, srcTys[0]);
@@ -263,7 +272,7 @@ private:
 
         auto resultLayout = resultTy.getEncoding();
 
-        unsigned resultElems = getElemsPerThread(resultTy);
+        unsigned resultElems = getTotalElemsPerThread(resultTy);
         auto resultIndices = emitIndices(loc, rewriter, resultLayout, resultTy);
         assert(resultIndices.size() == resultElems);
 
@@ -327,10 +336,10 @@ private:
                   elemPtrTys[i]);
     }
 
-    unsigned sizeIntraWarps = helper.getIntraWarpSize();
-    unsigned sizeInterWarps = helper.getInterWarpSize();
+    unsigned sizeIntraWarps = helper.getIntraWarpSizeWithUniqueData();
+    unsigned sizeInterWarps = helper.getInterWarpSizeWithUniqueData();
 
-    unsigned srcElems = getElemsPerThread(srcTys[0]);
+    unsigned srcElems = getTotalElemsPerThread(srcTys[0]);
     auto srcIndices = emitIndices(loc, rewriter, srcLayout, srcTys[0]);
     auto srcValues = unpackInputs(loc, op, adaptor, rewriter);
 
@@ -457,7 +466,7 @@ private:
               op.getResult()[i].getType().dyn_cast<RankedTensorType>()) {
         // nd-tensor where n >= 1
         auto resultLayout = resultTy.getEncoding().cast<SliceEncodingAttr>();
-        unsigned resultElems = getElemsPerThread(resultTy);
+        unsigned resultElems = getTotalElemsPerThread(resultTy);
         auto resultIndices = emitIndices(loc, rewriter, resultLayout, resultTy);
         assert(resultIndices.size() == resultElems);
 
@@ -486,10 +495,9 @@ private:
 
 void populateReduceOpToLLVMPatterns(
     TritonGPUToLLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
-    int numWarps, AxisInfoAnalysis &axisInfoAnalysis,
-    const Allocation *allocation, Value smem,
+    ModuleAllocation &allocation,
     ConvertTritonGPUOpToLLVMPatternBase::IndexCacheInfo &indexCacheInfo,
     PatternBenefit benefit) {
-  patterns.add<ReduceOpConversion>(typeConverter, allocation, smem,
-                                   indexCacheInfo, benefit);
+  patterns.add<ReduceOpConversion>(typeConverter, allocation, indexCacheInfo,
+                                   benefit);
 }

@@ -25,9 +25,16 @@
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Linker/Linker.h"
 #include "llvm/Support/SourceMgr.h"
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 #include <filesystem>
 #include <iterator>
+
+namespace fs = std::filesystem;
 
 namespace mlir {
 namespace triton {
@@ -113,6 +120,32 @@ extractNVVMMetadata(mlir::ModuleOp module,
   }
 }
 
+static std::filesystem::path getThisLibraryPath() {
+#ifdef _WIN32
+  /* Get module of the specified address */
+  HMODULE hModule;
+  GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                         GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                     reinterpret_cast<LPCSTR>(&getThisLibraryPath), &hModule);
+  if (NULL == hModule) {
+    return std::filesystem::path();
+  }
+
+  char fileName[1024]; // this is way beyond Windows MAX_PATH limit.
+  DWORD dwSize = GetModuleFileNameA(hModule, fileName, sizeof(fileName));
+  if (0 == dwSize || sizeof(fileName) == dwSize) {
+    return std::filesystem::path();
+  }
+  return std::filesystem::path(fileName);
+#else
+  Dl_info fileinfo;
+  if (dladdr(reinterpret_cast<void *>(&getThisLibraryPath), &fileinfo) == 0) {
+    return std::filesystem::path();
+  }
+  return std::filesystem::path(fileinfo.dli_fname);
+#endif
+}
+
 static std::map<std::string, std::string> getExternLibs(mlir::ModuleOp module) {
   std::map<std::string, std::string> externLibs;
   SmallVector<LLVM::LLVMFuncOp> funcs;
@@ -121,12 +154,12 @@ static std::map<std::string, std::string> getExternLibs(mlir::ModuleOp module) {
       funcs.push_back(func);
   });
 
-  for (auto &func : funcs) {
-    if (func.getOperation()->hasAttr("libname")) {
-      auto name =
-          func.getOperation()->getAttr("libname").dyn_cast<StringAttr>();
-      auto path =
-          func.getOperation()->getAttr("libpath").dyn_cast<StringAttr>();
+  for (LLVM::LLVMFuncOp func : funcs) {
+    if (auto libnameAttr = func->getDiscardableAttr("libname")) {
+      auto name = libnameAttr.dyn_cast<StringAttr>();
+      auto path = func.getOperation()
+                      ->getDiscardableAttr("libpath")
+                      .dyn_cast<StringAttr>();
       if (name) {
         std::string libName = name.str();
         externLibs[libName] = path.str();
@@ -134,11 +167,8 @@ static std::map<std::string, std::string> getExternLibs(mlir::ModuleOp module) {
     }
   }
 
-  if (module.getOperation()->hasAttr("triton_gpu.externs")) {
-    auto dict = module.getOperation()
-                    ->getAttr("triton_gpu.externs")
-                    .dyn_cast<DictionaryAttr>();
-    for (auto &attr : dict) {
+  if (auto externsAttr = module->getDiscardableAttr("triton_gpu.externs")) {
+    for (auto &attr : externsAttr.cast<DictionaryAttr>()) {
       externLibs[attr.getName().strref().trim().str()] =
           attr.getValue().dyn_cast<StringAttr>().strref().trim().str();
     }
@@ -152,17 +182,10 @@ static std::map<std::string, std::string> getExternLibs(mlir::ModuleOp module) {
       externLibs.try_emplace(libdevice, env_path);
       return externLibs;
     }
-    namespace fs = std::filesystem;
     // Search for libdevice relative to its library path if used from Python
     // Then native code is in `triton/_C/libtriton.so` and libdevice in
     // `triton/third_party/cuda/lib/libdevice.10.bc`
-    static const auto this_library_path = [] {
-      Dl_info fileinfo;
-      if (dladdr(reinterpret_cast<void *>(&getExternLibs), &fileinfo) == 0) {
-        return std::filesystem::path();
-      }
-      return std::filesystem::path(fileinfo.dli_fname);
-    }();
+    static const auto this_library_path = getThisLibraryPath();
     static const auto runtime_path =
         this_library_path.parent_path().parent_path() / "third_party" / "cuda" /
         "lib" / "libdevice.10.bc";
@@ -234,9 +257,10 @@ static bool linkExternLib(llvm::Module &module, llvm::StringRef name,
   if (!isROCM) {
     if (name == "libdevice") {
       linkLibdevice(module);
-    } else {
-      assert(false && "unknown extern lib: ");
     }
+    // else {
+    //   assert(false && "unknown extern lib: ");
+    // }
   }
 
   return false;

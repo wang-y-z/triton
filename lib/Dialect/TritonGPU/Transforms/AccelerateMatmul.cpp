@@ -44,20 +44,17 @@ SmallVector<int64_t, 2> mmaVersionToShapePerWarp(int version) {
 SmallVector<unsigned, 2> warpsPerTileV2(triton::DotOp dotOp,
                                         const ArrayRef<int64_t> shape,
                                         int numWarps) {
-  SetVector<Operation *> slices;
-  mlir::getForwardSlice(dotOp.getResult(), &slices);
-  if (llvm::find_if(slices, [](Operation *op) {
-        return isa<triton::DotOp>(op);
-      }) != slices.end())
-    return {(unsigned)numWarps, 1};
+  auto filter = [&dotOp](Operation *op) {
+    return op->getParentRegion() == dotOp->getParentRegion();
+  };
+  auto slices = mlir::getSlice(dotOp, filter);
+  for (Operation *op : slices)
+    if (isa<triton::DotOp>(op) && (op != dotOp))
+      return {(unsigned)numWarps, 1};
 
   SmallVector<unsigned, 2> ret = {1, 1};
   SmallVector<int64_t, 2> shapePerWarp = {16, 8};
   bool changed = false;
-  // TODO (@daadaada): double-check.
-  // original logic in
-  // https://github.com/openai/triton/blob/master/lib/codegen/analysis/layout.cc#L252
-  // seems buggy for shape = [32, 16] ?
   do {
     changed = false;
     if (ret[0] * ret[1] >= numWarps)
@@ -87,6 +84,8 @@ public:
   mlir::LogicalResult
   matchAndRewrite(mlir::Operation *op,
                   mlir::PatternRewriter &rewriter) const override {
+    if (computeCapability < 70)
+      return failure();
     auto dotOp = cast<triton::DotOp>(op);
     // TODO: Check data-types and SM compatibility
     auto oldRetType = dotOp.getResult().getType().cast<RankedTensorType>();
@@ -168,14 +167,17 @@ public:
                          .cast<triton::gpu::BlockedEncodingAttr>()
                          .getOrder();
 
+    auto newAEncoding = triton::gpu::DotOperandEncodingAttr::get(
+        oldAType.getContext(), 0, newRetType.getEncoding(),
+        oldAType.getElementType());
+    auto newBEncoding = triton::gpu::DotOperandEncodingAttr::get(
+        oldBType.getContext(), 1, newRetType.getEncoding(),
+        oldBType.getElementType());
+
     auto newAType = RankedTensorType::get(
-        oldAType.getShape(), oldAType.getElementType(),
-        triton::gpu::DotOperandEncodingAttr::get(oldAType.getContext(), 0,
-                                                 newRetType.getEncoding()));
+        oldAType.getShape(), oldAType.getElementType(), newAEncoding);
     auto newBType = RankedTensorType::get(
-        oldBType.getShape(), oldBType.getElementType(),
-        triton::gpu::DotOperandEncodingAttr::get(oldBType.getContext(), 1,
-                                                 newRetType.getEncoding()));
+        oldBType.getShape(), oldBType.getElementType(), newBEncoding);
 
     a = rewriter.create<triton::gpu::ConvertLayoutOp>(a.getLoc(), newAType, a);
     b = rewriter.create<triton::gpu::ConvertLayoutOp>(b.getLoc(), newBType, b);

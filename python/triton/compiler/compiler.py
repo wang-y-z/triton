@@ -11,14 +11,12 @@ from collections import namedtuple
 from pathlib import Path
 from typing import Any, Tuple
 
-import torch
-
 import triton
 import triton._C.libtriton.triton as _triton
+from ..runtime import driver
 # TODO: runtime.errors
 from ..runtime.autotuner import OutOfResources
 from ..runtime.cache import get_cache_manager
-from ..runtime.driver import get_cuda_utils, get_hip_utils
 from ..tools.disasm import extract
 from .code_generator import ast_to_ttir
 from .make_launcher import make_stub
@@ -105,7 +103,7 @@ def ttgir_to_llir(mod, extern_libs, arch):
 
 # PTX translation
 
-@functools.lru_cache
+@functools.lru_cache()
 def ptx_get_version(cuda_version) -> int:
     '''
     Get the highest PTX version supported by the current CUDA driver.
@@ -121,6 +119,7 @@ def ptx_get_version(cuda_version) -> int:
     raise RuntimeError("Triton only support CUDA 10.0 or higher")
 
 
+@functools.lru_cache()
 def path_to_ptxas():
     base_dir = os.path.join(os.path.dirname(__file__), os.pardir)
     paths = [
@@ -250,7 +249,7 @@ def convert_type_repr(x):
     return x
 
 
-def make_hash(fn, **kwargs):
+def make_hash(fn, arch, **kwargs):
     if isinstance(fn, triton.runtime.JITFunction):
         configs = kwargs["configs"]
         signature = kwargs["signature"]
@@ -261,7 +260,7 @@ def make_hash(fn, **kwargs):
         # Get unique key for the compiled code
         get_conf_key = lambda conf: (sorted(conf.divisible_by_16), sorted(conf.equal_to_1))
         configs_key = [get_conf_key(conf) for conf in configs]
-        key = f"{fn.cache_key}-{''.join(signature.values())}-{configs_key}-{constants}-{num_warps}-{num_stages}-{debug}"
+        key = f"{fn.cache_key}-{''.join(signature.values())}-{configs_key}-{constants}-{num_warps}-{num_stages}-{debug}-{arch}"
         return hashlib.md5(key.encode("utf-8")).hexdigest()
     assert isinstance(fn, str)
     return hashlib.md5((Path(fn).read_text() + triton.runtime.jit.version_key()).encode("utf-8")).hexdigest()
@@ -289,6 +288,8 @@ arg_type_pattern = {
     "ttgir": mlir_arg_type_pattern,
     "ptx": ptx_arg_type_pattern,
 }
+
+ttgir_num_warps_pattern = r'"triton_gpu.num-warps"\s?=\s?(\d+)\s?:'
 
 
 def _get_jsonable_constants(constants):
@@ -321,6 +322,10 @@ def _is_cuda(arch):
 
 
 def get_architecture_descriptor(capability):
+    try:
+        import torch
+    except ImportError:
+        raise ImportError("Triton requires PyTorch to be installed")
     if capability is None:
         if torch.version.hip is None:
             device = triton.runtime.jit.get_current_device()
@@ -404,6 +409,11 @@ def compile(fn, **kwargs):
         match = re.search(prototype_pattern[ir], src, re.MULTILINE)
         name, signature = match.group(1), match.group(2)
         types = re.findall(arg_type_pattern[ir], signature)
+        if ir == 'ttgir':
+            num_warps_matches = re.findall(ttgir_num_warps_pattern, src)
+            assert len(num_warps_matches) == 1, "Expected exactly one match for num_warps"
+            assert "num_warps" not in kwargs or int(num_warps_matches[0]) == num_warps, "num_warps in ttgir does not match num_warps in compile"
+            num_warps = int(num_warps_matches[0])
         param_tys = [convert_type_repr(ty) for ty in types]
         signature = {k: v for k, v in enumerate(param_tys)}
         first_stage = list(stages.keys()).index(ir)
@@ -411,7 +421,7 @@ def compile(fn, **kwargs):
     # cache manager
     so_path = make_stub(name, signature, constants)
     # create cache manager
-    fn_cache_manager = get_cache_manager(make_hash(fn, **kwargs))
+    fn_cache_manager = get_cache_manager(make_hash(fn, arch, **kwargs))
     # determine name and extension type of provided function
     if isinstance(fn, triton.runtime.JITFunction):
         name, ext = fn.__name__, "ast"
@@ -524,24 +534,19 @@ class CompiledKernel:
         self.metadata = metadata
         self.cu_module = None
         self.cu_function = None
-        self.is_hip = "amdgcn" in asm
 
     def _init_handles(self):
         if self.cu_module is not None:
             return
         device = triton.runtime.jit.get_current_device()
-        if self.is_hip:
-            hip_utils = get_hip_utils()
-            max_shared = hip_utils.get_device_properties(device)["max_shared_mem"]
-            if self.shared > max_shared:
-                raise OutOfResources(self.shared, max_shared, "shared memory")
-            mod, func, n_regs, n_spills = hip_utils.load_binary(self.metadata["name"], self.asm["hsaco_path"], self.shared, device)
-        else:
-            cuda_utils = get_cuda_utils()
-            max_shared = cuda_utils.get_device_properties(device)["max_shared_mem"]
-            if self.shared > max_shared:
-                raise OutOfResources(self.shared, max_shared, "shared memory")
-            mod, func, n_regs, n_spills = cuda_utils.load_binary(self.metadata["name"], self.asm["cubin"], self.shared, device)
+        bin_path = {
+            driver.HIP: "hsaco_path",
+            driver.CUDA: "cubin"
+        }[driver.backend]
+        max_shared = driver.utils.get_device_properties(device)["max_shared_mem"]
+        if self.shared > max_shared:
+            raise OutOfResources(self.shared, max_shared, "shared memory")
+        mod, func, n_regs, n_spills = driver.utils.load_binary(self.metadata["name"], self.asm[bin_path], self.shared, device)
 
         self.n_spills = n_spills
         self.n_regs = n_regs

@@ -155,7 +155,7 @@ def TT_LoadOp : TT_Op<"load",
                        "triton::EvictionPolicy":$evict, "bool":$isVolatile)>,
         // A tensor pointer with boundary check and padding
         OpBuilder<(ins "Value":$ptr, "ArrayRef<int32_t>":$boundaryCheck,
-                       "Optional<triton::PaddingOption>":$padding, "triton::CacheModifier":$cache,
+                       "std::optional<triton::PaddingOption>":$padding, "triton::CacheModifier":$cache,
                        "triton::EvictionPolicy":$evict, "bool":$isVolatile)>,
         // A tensor of pointers or a pointer to a scalar with mask
         OpBuilder<(ins "Value":$ptr, "Value":$mask, "triton::CacheModifier":$cache,
@@ -164,8 +164,9 @@ def TT_LoadOp : TT_Op<"load",
         OpBuilder<(ins "Value":$ptr, "Value":$mask, "Value":$other, "triton::CacheModifier":$cache,
                        "triton::EvictionPolicy":$evict, "bool":$isVolatile)>,
         // A utility function to build the operation with all attributes
-        OpBuilder<(ins "Value":$ptr, "Value":$mask, "Value":$other, "Optional<ArrayRef<int32_t>>":$boundaryCheck,
-                       "Optional<triton::PaddingOption>":$padding, "triton::CacheModifier":$cache,
+        OpBuilder<(ins "Value":$ptr, "Value":$mask, "Value":$other,
+                       "std::optional<ArrayRef<int32_t>>":$boundaryCheck,
+                       "std::optional<triton::PaddingOption>":$padding, "triton::CacheModifier":$cache,
                        "triton::EvictionPolicy":$evict, "bool":$isVolatile)>
     ];
 
@@ -420,14 +421,13 @@ def TT_ReduceReturnOp: TT_Op<"reduce.return",
 //
 // External Elementwise op
 //
-def TT_ExtElemwiseOp : TT_Op<"ext_elemwise", [Pure, Elementwise, SameOperandsAndResultShape,
-                                              SameOperandsAndResultEncoding,
-                                              SameVariadicOperandSize]> {
-    let summary = "ext_elemwise";
+class TT_ExternElementwiseOpBase<string mnemonic, list<Trait> traits = []> :
+    TT_Op<mnemonic,
+         traits # [SameOperandsAndResultEncoding,
+                   SameVariadicOperandSize]> {
 
     let description = [{
         call an external function $symbol implemented in $libpath/$libname with $args
-
         return $libpath/$libname:$symbol($args...)
     }];
 
@@ -435,7 +435,17 @@ def TT_ExtElemwiseOp : TT_Op<"ext_elemwise", [Pure, Elementwise, SameOperandsAnd
 
     let results = (outs TT_Type:$result);
 
-    let assemblyFormat = "operands attr-dict `:` type(operands) `->` type($result)";
+    let assemblyFormat = "operands attr-dict `:` functional-type(operands, $result)";
+}
+
+
+def TT_PureExternElementwiseOp : TT_ExternElementwiseOpBase<"pure_extern_elementwise", [Pure, Elementwise]> {
+    let summary = "FFI for pure element-wise extern LLVM bitcode functions";
+}
+
+def TT_ImpureExternElementwiseOp : TT_ExternElementwiseOpBase<"impure_extern_elementwise", [MemoryEffects<[MemRead]>,
+                                                                                            MemoryEffects<[MemWrite]>]> {
+    let summary = "FFI for impure element-wise extern LLVM bitcode functions";
 }
 
 //
@@ -469,7 +479,7 @@ def TT_PrintOp : TT_Op<"print", [MemoryEffects<[MemWrite]>]>,
     format are generated automatically from the arguments.
   }];
   let assemblyFormat = [{
-    $prefix attr-dict `:` ($args^ `:` type($args))?
+    $prefix attr-dict (`:` $args^ `:` type($args))?
   }];
 }
 
@@ -590,6 +600,11 @@ def CallOp : TT_Op<"call", [CallOpInterface, /*MemRefsNormalizable, */DeclareOpI
     /// Return the callee of this operation.
     CallInterfaceCallable getCallableForCallee() {
       return (*this)->getAttrOfType<SymbolRefAttr>("callee");
+    }
+
+    /// Set the callee for this operation.
+    void setCalleeFromCallable(CallInterfaceCallable callee) {
+      (*this)->setAttr("callee", callee.get<SymbolRefAttr>());
     }
   }];
 

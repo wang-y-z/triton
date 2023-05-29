@@ -6,7 +6,7 @@ using namespace mlir;
 using namespace mlir::triton;
 
 using ::mlir::LLVM::getSharedMemoryObjectFromStruct;
-using ::mlir::triton::gpu::getElemsPerThread;
+using ::mlir::triton::gpu::getTotalElemsPerThread;
 using ::mlir::triton::gpu::SharedEncodingAttr;
 
 struct ReturnOpConversion : public ConvertOpToLLVMPattern<triton::ReturnOp> {
@@ -345,8 +345,7 @@ struct MakeRangeOpConversion
       ConvertTritonGPUOpToLLVMPatternBase::IndexCacheInfo &indexCacheInfo,
       PatternBenefit benefit)
       : ConvertTritonGPUOpToLLVMPattern<triton::MakeRangeOp>(
-            converter, /*Allocation*/ nullptr, Value{}, indexCacheInfo,
-            benefit) {}
+            converter, indexCacheInfo, benefit) {}
 
   LogicalResult
   matchAndRewrite(triton::MakeRangeOp op, OpAdaptor adaptor,
@@ -435,7 +434,7 @@ struct AddPtrOpConversion
     auto ptrTy = op.getPtr().getType();
     auto resultTensorTy = resultTy.dyn_cast<RankedTensorType>();
     if (resultTensorTy) {
-      unsigned elems = getElemsPerThread(resultTy);
+      unsigned elems = getTotalElemsPerThread(resultTy);
       Type elemTy =
           getTypeConverter()->convertType(resultTensorTy.getElementType());
       auto ptrs = getTypeConverter()->unpackLLElements(loc, adaptor.getPtr(),
@@ -613,18 +612,17 @@ void vprintf_array(Value thread, ArrayRef<Value> arr, std::string info,
 
 void populateTritonGPUToLLVMPatterns(
     TritonGPUToLLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
-    int numWarps, AxisInfoAnalysis &axisInfoAnalysis,
-    const Allocation *allocation, Value smem,
+    ModuleAllocation &moduleAllocation,
     ConvertTritonGPUOpToLLVMPatternBase::IndexCacheInfo &indexCacheInfo,
     PatternBenefit benefit) {
   patterns.add<AddPtrOpConversion>(typeConverter, benefit);
-  patterns.add<AllocTensorOpConversion>(typeConverter, allocation, smem,
+  patterns.add<AllocTensorOpConversion>(typeConverter, moduleAllocation,
                                         benefit);
   patterns.add<AsyncCommitGroupOpConversion>(typeConverter, benefit);
   patterns.add<AsyncWaitOpConversion>(typeConverter, benefit);
   patterns.add<BroadcastOpConversion>(typeConverter, benefit);
 
-  patterns.add<ExtractSliceOpConversion>(typeConverter, allocation, smem,
+  patterns.add<ExtractSliceOpConversion>(typeConverter, moduleAllocation,
                                          benefit);
   patterns.add<GetProgramIdOpConversion>(typeConverter, benefit);
   patterns.add<GetNumProgramsOpConversion>(typeConverter, benefit);

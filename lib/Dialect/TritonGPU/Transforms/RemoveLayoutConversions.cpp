@@ -13,7 +13,6 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 #include "mlir/Transforms/RegionUtils.h"
-#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/Transforms/Passes.h"
 #include "triton/Dialect/TritonGPU/Transforms/TritonGPUConversion.h"
@@ -137,11 +136,12 @@ public:
           op->getLoc(), newTy, newOperands[i]);
     }
 
+    rewriter.setInsertionPoint(reduce);
     auto newReduce = rewriter.create<triton::ReduceOp>(
         op->getLoc(), newOperands, reduce.getAxis());
     auto &newCombineOp = newReduce.getCombineOp();
-    rewriter.inlineRegionBefore(reduce.getCombineOp(), newCombineOp,
-                                newCombineOp.end());
+    rewriter.cloneRegionBefore(reduce.getCombineOp(), newCombineOp,
+                               newCombineOp.end());
 
     SmallVector<Value> newRet = newReduce.getResult();
     auto oldTypes = reduce.getResult().getType();
@@ -340,33 +340,32 @@ public:
         cvt.getOperand().getType().cast<RankedTensorType>().getEncoding();
     auto dstEncoding =
         cvt.getResult().getType().cast<RankedTensorType>().getEncoding();
-    // XXX: why is this needed?
+    if (srcEncoding.isa<triton::gpu::SharedEncodingAttr>() ||
+        dstEncoding.isa<triton::gpu::SharedEncodingAttr>())
+      return failure();
+    // heuristics for flash attention
     if (srcEncoding.isa<triton::gpu::SliceEncodingAttr>())
       return failure();
     SetVector<Operation *> cvtSlices;
     auto filter = [&](Operation *op) {
       return op->getBlock() == cvt->getBlock() &&
+             !isa<triton::gpu::ConvertLayoutOp, scf::YieldOp>(op) &&
              !(isa<triton::ReduceOp>(op) &&
-               !op->getResult(0).getType().isa<RankedTensorType>()) &&
-             !isa<triton::gpu::ConvertLayoutOp>(op) && !isa<scf::YieldOp>(op);
+               !op->getResult(0).getType().isa<RankedTensorType>());
     };
     mlir::getForwardSlice(cvt.getResult(), &cvtSlices, filter);
-    if (cvtSlices.empty()) {
+    if (cvtSlices.empty())
       return failure();
-    }
 
-    llvm::MapVector<Value, Attribute> toConvert;
     for (Operation *op : cvtSlices) {
       // don't rematerialize anything expensive
-      if (expensiveToRemat(op, dstEncoding)) {
+      if (expensiveToRemat(op, dstEncoding))
         return failure();
-      }
       // don't rematerialize non-element-wise
       if (!op->hasTrait<mlir::OpTrait::SameOperandsAndResultEncoding>() &&
           !op->hasTrait<mlir::OpTrait::Elementwise>() &&
-          !isa<triton::StoreOp>(op)) {
+          !isa<triton::StoreOp, triton::ReduceOp>(op))
         return failure();
-      }
       // don't rematerialize if it adds an extra conversion that can't
       // be removed
       for (Value arg : op->getOperands()) {
@@ -374,11 +373,11 @@ public:
         SetVector<Operation *> processed;
         SetVector<Attribute> layout;
         llvm::MapVector<Value, Attribute> toConvert;
-        if (argOp && (argOp != cvt) && cvtSlices.count(argOp) == 0 &&
-            simulateBackwardRematerialization(argOp, processed, layout,
-                                              toConvert, srcEncoding) > 0) {
+        int numAddedConvs = simulateBackwardRematerialization(
+            argOp, processed, layout, toConvert, srcEncoding);
+        if (argOp && !isa<triton::gpu::ConvertLayoutOp>(argOp) &&
+            cvtSlices.count(argOp) == 0 && numAddedConvs > 0)
           return failure();
-        }
       }
     }
 
@@ -421,7 +420,6 @@ public:
     SetVector<Operation *> processed;
     SetVector<Attribute> layout;
     llvm::MapVector<Value, Attribute> toConvert;
-    std::vector<std::pair<Operation *, Attribute>> queue;
     if (simulateBackwardRematerialization(cvt, processed, layout, toConvert,
                                           targetType.getEncoding()) > 0)
       return mlir::failure();
@@ -503,49 +501,15 @@ public:
     auto forOp = cast<scf::ForOp>(op);
     auto iterArgs = forOp.getRegionIterArgs();
     for (const auto &iterArg : llvm::enumerate(iterArgs)) {
-      // if (iterArg.index() != 1)
-      //   continue;
       // skip non-tensor types
       if (!iterArg.value().getType().isa<RankedTensorType>())
         continue;
-      // we only move `iterArg` out of the loop if
-      //   - there is only a single conversion use
-      //   - moving this conversion out of the loop will not generate
-      //     any extra non-removable conversion
-      auto users = iterArg.value().getUsers();
-      // check first condition
-      SetVector<Type> cvtTargetTypes;
-      for (auto user : users) {
-        if (isa<triton::gpu::ConvertLayoutOp>(user)) {
-          auto newType =
-              user->getResults()[0].getType().cast<RankedTensorType>();
-          auto oldType = user->getOperand(0).getType().cast<RankedTensorType>();
-          if (oldType.getEncoding().isa<triton::gpu::SharedEncodingAttr>() &&
-              newType.getEncoding()
-                  .isa<triton::gpu::DotOperandEncodingAttr>()) {
-            continue;
-          }
-          if (newType.getEncoding().isa<triton::gpu::SharedEncodingAttr>()) {
-            if (newType.getEncoding()
-                    .cast<triton::gpu::SharedEncodingAttr>()
-                    .getVec() == 1)
-              continue;
-          }
-          cvtTargetTypes.insert(newType);
-        }
-      }
-      if (cvtTargetTypes.size() != 1)
+      SmallVector<Operation *> cvts;
+      if (canMoveOutOfLoop(iterArg.value(), cvts).failed())
         continue;
-      // TODO: check second condition
-      for (auto user : users) {
-        if (isa<triton::gpu::ConvertLayoutOp>(user))
-          continue;
-      }
       // check
-      for (auto op : iterArg.value().getUsers()) {
+      for (auto *op : cvts) {
         auto cvt = dyn_cast<triton::gpu::ConvertLayoutOp>(op);
-        if (!cvt)
-          continue;
         auto targetType = op->getResultTypes()[0].cast<RankedTensorType>();
         auto newFor = rematerializeForLoop(rewriter, forOp, iterArg.index(),
                                            targetType, cvt);

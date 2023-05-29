@@ -25,9 +25,9 @@ jobs:
         id: set-matrix
         run: |
           if [ x"${{ github.repository }}" == x"openai/triton" ]; then
-            echo '::set-output name=matrix::[["self-hosted", "A100"], ["self-hosted", "V100"], ["self-hosted", "gfx908"], "macos-10.15"]'
+            echo '::set-output name=matrix::[["self-hosted", "A100"], ["self-hosted", "V100"], ["self-hosted", "gfx908"]]'
           else
-            echo '::set-output name=matrix::["ubuntu-latest", "macos-10.15"]'
+            echo '::set-output name=matrix::["ubuntu-latest"]'
           fi
 
   Integration-Tests:
@@ -89,7 +89,7 @@ jobs:
         run: |
           python3 -m pip install lit
           cd python
-          LIT_TEST_DIR="build/$(ls build | grep -i temp)/test"
+          LIT_TEST_DIR="build/$(ls build | grep -i cmake)/test"
           if [ ! -d "${LIT_TEST_DIR}" ]; then
             echo "Coult not find '${LIT_TEST_DIR}'" ; exit -1
           fi
@@ -101,11 +101,23 @@ jobs:
           cd python/test/unit
           python3 -m pytest
 
+      - name: Create artifacts archive
+        if: ${{(matrix.runner[0] == 'self-hosted') && (matrix.runner[1] == 'V100' || matrix.runner[1] == 'A100')}}
+        run: |
+          tar -czvf artifacts.tar.gz ~/.triton/cache
+
+      - name: Upload artifacts archive
+        if: ${{(matrix.runner[0] == 'self-hosted') && (matrix.runner[1] == 'V100' || matrix.runner[1] == 'A100')}}
+        uses: actions/upload-artifact@v2
+        with:
+          name: artifacts
+          path: artifacts.tar.gz
+
       - name: Run CXX unittests
         if: ${{ env.BACKEND != 'ROCM'}}
         run: |
           cd python
-          cd "build/$(ls build | grep -i temp)"
+          cd "build/$(ls build | grep -i cmake)"
           ctest
 
       - name: Run python tests on ROCM

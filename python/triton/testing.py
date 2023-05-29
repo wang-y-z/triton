@@ -5,7 +5,6 @@ import sys
 from contextlib import contextmanager
 
 import triton._C.libtriton.triton as _triton
-from .runtime.driver.cuda import get_cuda_utils
 
 
 def nvsmi(attrs):
@@ -41,29 +40,33 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None,
     :type fast_flush: bool
     """
 
-    # Estimate the runtime of the function
     fn()
     torch.cuda.synchronize()
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-    start_event.record()
-    for _ in range(5):
-        fn()
-    end_event.record()
-    torch.cuda.synchronize()
-    estimate_ms = start_event.elapsed_time(end_event) / 5
-    # compute number of warmup and repeat
-    n_warmup = max(1, int(warmup / estimate_ms))
-    n_repeat = max(1, int(rep / estimate_ms))
+
     # We maintain a buffer of 256 MB that we clear
     # before each kernel call to make sure that the L2
     # doesn't contain any input data before the run
-    start_event = [torch.cuda.Event(enable_timing=True) for i in range(n_repeat)]
-    end_event = [torch.cuda.Event(enable_timing=True) for i in range(n_repeat)]
     if fast_flush:
         cache = torch.empty(int(256e6 // 4), dtype=torch.int, device='cuda')
     else:
         cache = torch.empty(int(256e6), dtype=torch.int8, device='cuda')
+
+    # Estimate the runtime of the function
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
+    start_event.record()
+    for _ in range(5):
+        cache.zero_()
+        fn()
+    end_event.record()
+    torch.cuda.synchronize()
+    estimate_ms = start_event.elapsed_time(end_event) / 5
+
+    # compute number of warmup and repeat
+    n_warmup = max(1, int(warmup / estimate_ms))
+    n_repeat = max(1, int(rep / estimate_ms))
+    start_event = [torch.cuda.Event(enable_timing=True) for i in range(n_repeat)]
+    end_event = [torch.cuda.Event(enable_timing=True) for i in range(n_repeat)]
     # Warm-up
     for _ in range(n_warmup):
         fn()
@@ -275,28 +278,30 @@ def perf_report(benchmarks):
 def get_dram_gbps(backend=None, device=None):
     ''' return DRAM bandwidth in GB/s '''
     import torch
+
+    from .runtime import driver
     if not backend:
         backend = _triton.runtime.backend.CUDA
     if not device:
         device = torch.cuda.current_device()
-    cuda_utils = get_cuda_utils()
-    mem_clock_khz = cuda_utils.get_device_properties(device)["mem_clock_rate"]  # in kHz
-    bus_width = cuda_utils.get_device_properties(device)["mem_bus_width"]
+    mem_clock_khz = driver.utils.get_device_properties(device)["mem_clock_rate"]  # in kHz
+    bus_width = driver.utils.get_device_properties(device)["mem_bus_width"]
     bw_gbps = mem_clock_khz * bus_width * 2 / 1e6 / 8  # In GB/s
     return bw_gbps
 
 
 def get_max_tensorcore_tflops(dtype, backend=None, device=None, clock_rate=None):
     import torch
+
+    from .runtime import driver
     if not backend:
         backend = _triton.runtime.backend.CUDA
     if not device:
         device = torch.cuda.current_device()
 
-    cuda_utils = get_cuda_utils()
-    num_subcores = cuda_utils.get_device_properties(device)["multiprocessor_count"] * 4
+    num_subcores = driver.utils.get_device_properties(device)["multiprocessor_count"] * 4
     if not clock_rate:
-        clock_rate = cuda_utils.get_device_properties(device)["sm_clock_rate"]  # in kHz
+        clock_rate = driver.utils.get_device_properties(device)["sm_clock_rate"]  # in kHz
     capability = torch.cuda.get_device_capability(device)
     if capability[0] < 8:
         assert dtype == torch.float16
@@ -390,14 +395,15 @@ def set_gpu_clock(ref_sm_clock=1350, ref_mem_clock=1215):
 
 def get_max_simd_tflops(dtype, backend=None, device=None):
     import torch
+
+    from .runtime import driver
     if not backend:
         backend = _triton.runtime.backend.CUDA
     if not device:
         device = torch.cuda.current_device()
 
-    cuda_utils = get_cuda_utils()
-    num_subcores = cuda_utils.get_device_properties(device)["multiprocessor_count"] * 4
-    clock_rate = cuda_utils.get_device_properties(device)["sm_clock_rate"]  # in kHz
+    num_subcores = driver.utils.get_device_properties(device)["multiprocessor_count"] * 4
+    clock_rate = driver.utils.get_device_properties(device)["sm_clock_rate"]  # in kHz
     capability = torch.cuda.get_device_capability()
     if capability[0] < 8:
         if dtype == torch.float32:

@@ -7,10 +7,10 @@ using ::mlir::LLVM::getSharedMemoryObjectFromStruct;
 using ::mlir::LLVM::getStridesFromShapeAndOrder;
 using ::mlir::triton::gpu::DotOperandEncodingAttr;
 using ::mlir::triton::gpu::getContigPerThread;
-using ::mlir::triton::gpu::getElemsPerThread;
 using ::mlir::triton::gpu::getOrder;
 using ::mlir::triton::gpu::getShapePerCTA;
 using ::mlir::triton::gpu::getSizePerThread;
+using ::mlir::triton::gpu::getTotalElemsPerThread;
 using ::mlir::triton::gpu::isaDistributedLayout;
 using ::mlir::triton::gpu::SharedEncodingAttr;
 
@@ -358,11 +358,11 @@ SmallVector<CoordTy> getMNCoords(Value thread,
   Value _fpw1 = i32_val(fpw[1]);
 
   // A info
-  auto aEncoding = DotOperandEncodingAttr::get(ctx, 0, mmaLayout);
+  auto aEncoding = DotOperandEncodingAttr::get(ctx, 0, mmaLayout, 0);
   auto aRep = aEncoding.getMMAv1Rep();
   auto aSpw = aEncoding.getMMAv1ShapePerWarp();
   // B info
-  auto bEncoding = DotOperandEncodingAttr::get(ctx, 1, mmaLayout);
+  auto bEncoding = DotOperandEncodingAttr::get(ctx, 1, mmaLayout, 0);
   auto bSpw = bEncoding.getMMAv1ShapePerWarp();
   auto bRep = bEncoding.getMMAv1Rep();
 

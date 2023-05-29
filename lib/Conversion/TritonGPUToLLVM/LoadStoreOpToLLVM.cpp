@@ -8,12 +8,12 @@ using namespace mlir;
 using namespace mlir::triton;
 
 using ::mlir::LLVM::getSharedMemoryObjectFromStruct;
-using ::mlir::triton::gpu::getElemsPerThread;
+using ::mlir::triton::gpu::getTotalElemsPerThread;
 using ::mlir::triton::gpu::SharedEncodingAttr;
 
 // Contains some helper functions for both Load and Store conversions.
 struct LoadStoreConversionBase {
-  explicit LoadStoreConversionBase(AxisInfoAnalysis &axisAnalysisPass)
+  explicit LoadStoreConversionBase(ModuleAxisInfoAnalysis &axisAnalysisPass)
       : axisAnalysisPass(axisAnalysisPass) {}
 
   unsigned getContiguity(Value ptr) const {
@@ -38,7 +38,7 @@ struct LoadStoreConversionBase {
   }
 
 protected:
-  AxisInfoAnalysis &axisAnalysisPass;
+  ModuleAxisInfoAnalysis &axisAnalysisPass;
 };
 
 struct LoadOpConversion
@@ -48,7 +48,8 @@ struct LoadOpConversion
       triton::LoadOp>::ConvertTritonGPUOpToLLVMPattern;
 
   LoadOpConversion(TritonGPUToLLVMTypeConverter &converter,
-                   AxisInfoAnalysis &axisAnalysisPass, PatternBenefit benefit)
+                   ModuleAxisInfoAnalysis &axisAnalysisPass,
+                   PatternBenefit benefit)
       : ConvertTritonGPUOpToLLVMPattern<triton::LoadOp>(converter, benefit),
         LoadStoreConversionBase(axisAnalysisPass) {}
 
@@ -72,7 +73,7 @@ struct LoadOpConversion
     Type valueElemTy =
         typeConverter->convertType(getElementTypeOrSelf(valueTy));
     unsigned vec = getVectorSize(ptr);
-    unsigned numElems = getElemsPerThread(ptr.getType());
+    unsigned numElems = getTotalElemsPerThread(ptr.getType());
     if (llMask)
       vec = std::min<size_t>(vec, getMaskAlignment(mask));
 
@@ -254,7 +255,8 @@ struct StoreOpConversion
       triton::StoreOp>::ConvertTritonGPUOpToLLVMPattern;
 
   StoreOpConversion(TritonGPUToLLVMTypeConverter &converter,
-                    AxisInfoAnalysis &axisAnalysisPass, PatternBenefit benefit)
+                    ModuleAxisInfoAnalysis &axisAnalysisPass,
+                    PatternBenefit benefit)
       : ConvertTritonGPUOpToLLVMPattern<triton::StoreOp>(converter, benefit),
         LoadStoreConversionBase(axisAnalysisPass) {}
 
@@ -276,7 +278,7 @@ struct StoreOpConversion
         typeConverter->convertType(getElementTypeOrSelf(valueTy));
 
     unsigned vec = getVectorSize(ptr);
-    unsigned elemsPerThread = getElemsPerThread(ptr.getType());
+    unsigned elemsPerThread = getTotalElemsPerThread(ptr.getType());
 
     auto ptrElems = getTypeConverter()->unpackLLElements(loc, llPtr, rewriter,
                                                          ptr.getType());
@@ -296,14 +298,7 @@ struct StoreOpConversion
       vec = std::min(vec, maskAlign);
     }
 
-    // numElements = 1 for scalar
-    auto tensorTy = valueTy.dyn_cast<RankedTensorType>();
-    auto numElems = tensorTy ? tensorTy.getNumElements() : 1;
-    Value mask = int_val(1, 1);
-    auto tid = tid_val();
-    mask = and_(mask,
-                icmp_slt(mul(tid, i32_val(elemsPerThread)), i32_val(numElems)));
-
+    Value mask = getMask(valueTy, rewriter, loc);
     const size_t dtsize =
         std::max<int>(1, valueElemTy.getIntOrFloatBitWidth() / 8);
     const size_t valueElemNBits = dtsize * 8;
@@ -380,11 +375,11 @@ struct AtomicCASOpConversion
       triton::AtomicCASOp>::ConvertTritonGPUOpToLLVMPattern;
 
   AtomicCASOpConversion(TritonGPUToLLVMTypeConverter &converter,
-                        const Allocation *allocation, Value smem,
-                        AxisInfoAnalysis &axisAnalysisPass,
+                        ModuleAllocation &allocation,
+                        ModuleAxisInfoAnalysis &axisAnalysisPass,
                         PatternBenefit benefit)
       : ConvertTritonGPUOpToLLVMPattern<triton::AtomicCASOp>(
-            converter, allocation, smem, benefit),
+            converter, allocation, benefit),
         LoadStoreConversionBase(axisAnalysisPass) {}
 
   LogicalResult
@@ -404,13 +399,13 @@ struct AtomicCASOpConversion
     auto valElements = getTypeConverter()->unpackLLElements(
         loc, llVal, rewriter, op.getVal().getType());
 
-    auto TensorTy = op.getResult().getType().dyn_cast<RankedTensorType>();
+    auto valueTy = op.getResult().getType();
+    auto TensorTy = valueTy.dyn_cast<RankedTensorType>();
     Type valueElemTy =
         TensorTy ? getTypeConverter()->convertType(TensorTy.getElementType())
-                 : op.getResult().getType();
+                 : valueTy;
     auto valueElemNBits = valueElemTy.getIntOrFloatBitWidth();
-    auto tid = tid_val();
-    Value pred = icmp_eq(tid, i32_val(0));
+    Value mask = getMask(valueTy, rewriter, loc);
     PTXBuilder ptxBuilderMemfence;
     auto memfence = ptxBuilderMemfence.create<PTXInstr>("membar")->o("gl");
     memfence();
@@ -430,7 +425,7 @@ struct AtomicCASOpConversion
     auto *valOpr = ptxBuilderAtomicCAS.newOperand(casVal, "r");
     auto &atom = *ptxBuilderAtomicCAS.create<PTXInstr>("atom");
     atom.global().o("cas").o("b32");
-    atom(dstOpr, ptrOpr, cmpOpr, valOpr).predicate(pred);
+    atom(dstOpr, ptrOpr, cmpOpr, valOpr).predicate(mask);
     auto old = ptxBuilderAtomicCAS.launch(rewriter, loc, valueElemTy);
     barrier();
 
@@ -439,7 +434,7 @@ struct AtomicCASOpConversion
     auto *valOprStore = ptxBuilderStore.newOperand(old, "r");
     auto &st = *ptxBuilderStore.create<PTXInstr>("st");
     st.shared().o("b32");
-    st(dstOprStore, valOprStore).predicate(pred);
+    st(dstOprStore, valOprStore).predicate(mask);
     ptxBuilderStore.launch(rewriter, loc, ASMReturnTy);
     ptxBuilderMemfence.launch(rewriter, loc, ASMReturnTy);
     barrier();
@@ -457,11 +452,11 @@ struct AtomicRMWOpConversion
       triton::AtomicRMWOp>::ConvertTritonGPUOpToLLVMPattern;
 
   AtomicRMWOpConversion(TritonGPUToLLVMTypeConverter &converter,
-                        const Allocation *allocation, Value smem,
-                        AxisInfoAnalysis &axisAnalysisPass,
+                        ModuleAllocation &allocation,
+                        ModuleAxisInfoAnalysis &axisAnalysisPass,
                         PatternBenefit benefit)
       : ConvertTritonGPUOpToLLVMPattern<triton::AtomicRMWOp>(
-            converter, allocation, smem, benefit),
+            converter, allocation, benefit),
         LoadStoreConversionBase(axisAnalysisPass) {}
 
   LogicalResult
@@ -488,12 +483,13 @@ struct AtomicRMWOpConversion
       maskElements = getTypeConverter()->unpackLLElements(
           loc, llMask, rewriter, op.getMask().getType());
 
-    auto tensorTy = op.getResult().getType().dyn_cast<RankedTensorType>();
+    auto valueTy = op.getResult().getType();
+    auto tensorTy = valueTy.dyn_cast<RankedTensorType>();
     Type valueElemTy =
         tensorTy ? getTypeConverter()->convertType(tensorTy.getElementType())
-                 : op.getResult().getType();
+                 : valueTy;
     const size_t valueElemNBits = valueElemTy.getIntOrFloatBitWidth();
-    auto elemsPerThread = getElemsPerThread(val.getType());
+    auto elemsPerThread = getTotalElemsPerThread(val.getType());
     // vec = 1, numElements = 1 for scalar
     auto vec = getVectorSize(ptr);
     int numElems = 1;
@@ -504,10 +500,7 @@ struct AtomicRMWOpConversion
       // mask
       numElems = tensorTy.getNumElements();
     }
-    Value mask = int_val(1, 1);
-    auto tid = tid_val();
-    mask = and_(mask,
-                icmp_slt(mul(tid, i32_val(elemsPerThread)), i32_val(numElems)));
+    Value mask = getMask(valueTy, rewriter, loc);
 
     auto vecTy = vec_ty(valueElemTy, vec);
     SmallVector<Value> resultVals(elemsPerThread);
@@ -587,7 +580,6 @@ struct AtomicRMWOpConversion
         memfenc();
         auto ASMReturnTy = void_ty(ctx);
         ptxBuilderMemfence.launch(rewriter, loc, ASMReturnTy);
-        rmwMask = and_(rmwMask, icmp_eq(tid, i32_val(0)));
         atom(dstOpr, ptrOpr, valOpr).predicate(rmwMask);
         auto old = ptxBuilderAtomicRMW.launch(rewriter, loc, valueElemTy);
         Value atomPtr = getSharedMemoryBase(loc, rewriter, op.getOperation());
@@ -629,7 +621,9 @@ struct InsertSliceOpConversion
     Value dst = op.getDest();
     Value src = op.getSource();
     Value res = op.getResult();
-    assert(allocation->getBufferId(res) == Allocation::InvalidBufferId &&
+    auto funcOp = op->getParentOfType<FunctionOpInterface>();
+    auto *funcAllocation = allocation->getFuncData(funcOp);
+    assert(funcAllocation->getBufferId(res) == Allocation::InvalidBufferId &&
            "Only support in-place insert_slice for now");
 
     auto srcTy = src.getType().dyn_cast<RankedTensorType>();
@@ -689,12 +683,11 @@ struct InsertSliceAsyncOpConversion
       triton::gpu::InsertSliceAsyncOp>::ConvertTritonGPUOpToLLVMPattern;
 
   InsertSliceAsyncOpConversion(
-      TritonGPUToLLVMTypeConverter &converter, const Allocation *allocation,
-      Value smem,
+      TritonGPUToLLVMTypeConverter &converter, ModuleAllocation &allocation,
       ConvertTritonGPUOpToLLVMPatternBase::IndexCacheInfo &indexCacheInfo,
-      AxisInfoAnalysis &axisAnalysisPass, PatternBenefit benefit)
+      ModuleAxisInfoAnalysis &axisAnalysisPass, PatternBenefit benefit)
       : ConvertTritonGPUOpToLLVMPattern<triton::gpu::InsertSliceAsyncOp>(
-            converter, allocation, smem, indexCacheInfo, benefit),
+            converter, allocation, indexCacheInfo, benefit),
         LoadStoreConversionBase(axisAnalysisPass) {}
 
   LogicalResult
@@ -707,7 +700,9 @@ struct InsertSliceAsyncOpConversion
     Value res = op.getResult();
     Value mask = op.getMask();
     Value other = op.getOther();
-    assert(allocation->getBufferId(res) == Allocation::InvalidBufferId &&
+    auto funcOp = op->getParentOfType<FunctionOpInterface>();
+    auto *funcAllocation = allocation->getFuncData(funcOp);
+    assert(funcAllocation->getBufferId(res) == Allocation::InvalidBufferId &&
            "Only support in-place insert_slice_async for now");
 
     auto srcTy = src.getType().cast<RankedTensorType>();
@@ -776,7 +771,7 @@ struct InsertSliceAsyncOpConversion
     unsigned inVec = getContiguity(src);
     unsigned outVec = resSharedLayout.getVec();
     unsigned minVec = std::min(outVec, inVec);
-    unsigned numElems = getElemsPerThread(srcTy);
+    unsigned numElems = getTotalElemsPerThread(srcTy);
     unsigned perPhase = resSharedLayout.getPerPhase();
     unsigned maxPhase = resSharedLayout.getMaxPhase();
     auto sizePerThread = srcBlockedLayout.getSizePerThread();
@@ -847,19 +842,17 @@ struct InsertSliceAsyncOpConversion
 
 void populateLoadStoreOpToLLVMPatterns(
     TritonGPUToLLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
-    int numWarps, AxisInfoAnalysis &axisInfoAnalysis,
-    const Allocation *allocation, Value smem,
+    ModuleAxisInfoAnalysis &axisInfoAnalysis, ModuleAllocation &allocation,
     ConvertTritonGPUOpToLLVMPatternBase::IndexCacheInfo &indexCacheInfo,
     PatternBenefit benefit) {
   patterns.add<LoadOpConversion>(typeConverter, axisInfoAnalysis, benefit);
   patterns.add<StoreOpConversion>(typeConverter, axisInfoAnalysis, benefit);
-  patterns.add<AtomicCASOpConversion>(typeConverter, allocation, smem,
+  patterns.add<AtomicCASOpConversion>(typeConverter, allocation,
                                       axisInfoAnalysis, benefit);
-  patterns.add<AtomicRMWOpConversion>(typeConverter, allocation, smem,
+  patterns.add<AtomicRMWOpConversion>(typeConverter, allocation,
                                       axisInfoAnalysis, benefit);
-  patterns.add<InsertSliceOpConversion>(typeConverter, allocation, smem,
+  patterns.add<InsertSliceOpConversion>(typeConverter, allocation,
                                         indexCacheInfo, benefit);
-  patterns.add<InsertSliceAsyncOpConversion>(typeConverter, allocation, smem,
-                                             indexCacheInfo, axisInfoAnalysis,
-                                             benefit);
+  patterns.add<InsertSliceAsyncOpConversion>(
+      typeConverter, allocation, indexCacheInfo, axisInfoAnalysis, benefit);
 }

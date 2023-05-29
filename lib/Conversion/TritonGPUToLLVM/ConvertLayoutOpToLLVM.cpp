@@ -5,10 +5,10 @@ using ::mlir::LLVM::getSharedMemoryObjectFromStruct;
 using ::mlir::LLVM::getStridesFromShapeAndOrder;
 using ::mlir::triton::gpu::DotOperandEncodingAttr;
 using ::mlir::triton::gpu::getContigPerThread;
-using ::mlir::triton::gpu::getElemsPerThread;
 using ::mlir::triton::gpu::getOrder;
 using ::mlir::triton::gpu::getShapePerCTA;
 using ::mlir::triton::gpu::getSizePerThread;
+using ::mlir::triton::gpu::getTotalElemsPerThread;
 using ::mlir::triton::gpu::isaDistributedLayout;
 using ::mlir::triton::gpu::SharedEncodingAttr;
 
@@ -77,6 +77,10 @@ public:
         dstLayout.isa<DotOperandEncodingAttr>()) {
       return lowerMmaToDotOperand(op, adaptor, rewriter);
     }
+    if (srcLayout.isa<SharedEncodingAttr>() &&
+        isaDistributedLayout(dstLayout)) {
+      return lowerSharedToDistributed(op, adaptor, rewriter);
+    }
     // TODO: to be implemented
     llvm_unreachable("unsupported layout conversion");
     return failure();
@@ -106,13 +110,22 @@ private:
     if (auto sliceLayout = layout.dyn_cast<SliceEncodingAttr>()) {
       unsigned dim = sliceLayout.getDim();
       auto parentEncoding = sliceLayout.getParent();
+      auto parentSizePerThread = getSizePerThread(parentEncoding);
       auto parentShape = sliceLayout.paddedShape(shape);
       auto parentTy = RankedTensorType::get(parentShape, type.getElementType(),
                                             parentEncoding);
-      auto multiDimOffsetParent =
-          getMultiDimOffset(parentEncoding, loc, rewriter, elemId, parentTy,
-                            sliceLayout.paddedShape(multiDimCTAInRepId),
-                            sliceLayout.paddedShape(shapePerCTA));
+      auto offsets = emitOffsetForLayout(layout, type);
+      auto parentOffset = emitOffsetForLayout(parentEncoding, parentTy);
+      SmallVector<int> idxs;
+      for (SmallVector<unsigned> off : offsets) {
+        off.insert(off.begin() + dim, 0);
+        auto it = std::find(parentOffset.begin(), parentOffset.end(), off);
+        idxs.push_back(std::distance(parentOffset.begin(), it));
+      }
+      auto multiDimOffsetParent = getMultiDimOffset(
+          parentEncoding, loc, rewriter, idxs[elemId], parentTy,
+          sliceLayout.paddedShape(multiDimCTAInRepId),
+          sliceLayout.paddedShape(shapePerCTA));
       SmallVector<Value> multiDimOffset(rank);
       for (unsigned d = 0; d < rank + 1; ++d) {
         if (d == dim)
@@ -325,7 +338,8 @@ private:
 
       if (needTrans) {
         // do transpose
-        auto aEncoding = DotOperandEncodingAttr::get(mma.getContext(), 0, mma);
+        auto aEncoding =
+            DotOperandEncodingAttr::get(mma.getContext(), 0, mma, 0);
         int numM = aEncoding.getMMAv1NumOuter(shape);
         int numN = accumSizePerThread / numM;
 
@@ -422,14 +436,14 @@ private:
     }
     // Potentially we need to store for multiple CTAs in this replication
     auto accumNumReplicates = product<unsigned>(numReplicates);
-    // unsigned elems = getElemsPerThread(srcTy);
+    // unsigned elems = getTotalElemsPerThread(srcTy);
     auto vals = getTypeConverter()->unpackLLElements(loc, adaptor.getSrc(),
                                                      rewriter, srcTy);
     unsigned inVec = 0;
     unsigned outVec = 0;
     auto paddedRepShape = getScratchConfigForCvtLayout(op, inVec, outVec);
 
-    unsigned outElems = getElemsPerThread(dstTy);
+    unsigned outElems = getTotalElemsPerThread(dstTy);
     auto outOrd = getOrder(dstLayout);
     SmallVector<Value> outVals(outElems);
 
@@ -472,9 +486,40 @@ private:
       }
     }
 
-    SmallVector<Type> types(outElems, llvmElemTy);
-    auto *ctx = llvmElemTy.getContext();
-    Type structTy = struct_ty(types);
+    Value result =
+        getTypeConverter()->packLLElements(loc, outVals, rewriter, dstTy);
+    rewriter.replaceOp(op, result);
+
+    return success();
+  }
+
+  LogicalResult
+  lowerSharedToDistributed(triton::gpu::ConvertLayoutOp op, OpAdaptor adaptor,
+                           ConversionPatternRewriter &rewriter) const {
+    auto loc = op.getLoc();
+    Value src = op.getSrc();
+    Value dst = op.getResult();
+    auto srcTy = src.getType().cast<RankedTensorType>();
+    auto srcShape = srcTy.getShape();
+    auto dstTy = dst.getType().cast<RankedTensorType>();
+    auto dstShape = dstTy.getShape();
+    assert(dstShape.size() == 2 &&
+           "Unexpected rank of ConvertLayout(shared->blocked)");
+    auto srcSharedLayout = srcTy.getEncoding().cast<SharedEncodingAttr>();
+    auto dstLayout = dstTy.getEncoding();
+    auto inOrd = getOrder(srcSharedLayout);
+
+    auto smemObj =
+        getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(), rewriter);
+    auto elemTy = getTypeConverter()->convertType(dstTy.getElementType());
+
+    auto srcStrides =
+        getStridesFromShapeAndOrder(srcShape, inOrd, loc, rewriter);
+    auto dstIndices = emitIndices(loc, rewriter, dstLayout, dstTy);
+
+    SmallVector<Value> outVals = loadSharedToDistributed(
+        dst, dstIndices, src, smemObj, elemTy, loc, rewriter);
+
     Value result =
         getTypeConverter()->packLLElements(loc, outVals, rewriter, dstTy);
     rewriter.replaceOp(op, result);
@@ -572,7 +617,7 @@ private:
       // get source values
       auto vals = getTypeConverter()->unpackLLElements(loc, adaptor.getSrc(),
                                                        rewriter, srcTy);
-      unsigned elems = getElemsPerThread(srcTy);
+      unsigned elems = getTotalElemsPerThread(srcTy);
       Type elemTy =
           this->getTypeConverter()->convertType(srcTy.getElementType());
       // for the destination type, we need to pack values together
@@ -615,10 +660,10 @@ private:
       // is implemented
       SmallVector<Value> reorderedVals;
       for (unsigned i = 0; i < vecVals.size(); i += 4) {
-        reorderedVals.push_back(vecVals[i]);
-        reorderedVals.push_back(vecVals[i + 2]);
-        reorderedVals.push_back(vecVals[i + 1]);
-        reorderedVals.push_back(vecVals[i + 3]);
+        reorderedVals.push_back(bitcast(vecVals[i], i32_ty));
+        reorderedVals.push_back(bitcast(vecVals[i + 2], i32_ty));
+        reorderedVals.push_back(bitcast(vecVals[i + 1], i32_ty));
+        reorderedVals.push_back(bitcast(vecVals[i + 3], i32_ty));
       }
 
       Value view = getTypeConverter()->packLLElements(loc, reorderedVals,
@@ -637,19 +682,19 @@ private:
     auto loc = op.getLoc();
     Value src = op.getSrc();
     Value dst = op.getResult();
-    bool isHMMA = supportMMA(dst, mmaLayout.getVersionMajor());
 
     auto smemObj =
         getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(), rewriter);
     Value res;
 
-    if (!isOuter && mmaLayout.isAmpere() && isHMMA) { // tensor core v2
+    if (!isOuter && mmaLayout.isAmpere()) { // tensor core v2
 
       res = SharedToDotOperandMMAv2::convertLayout(
           dotOperandLayout.getOpIdx(), rewriter, loc, src, dotOperandLayout,
           smemObj, getTypeConverter(), tid_val());
 
-    } else if (!isOuter && mmaLayout.isVolta() && isHMMA) { // tensor core v1
+    } else if (!isOuter && mmaLayout.isVolta() &&
+               supportMMA(dst, mmaLayout.getVersionMajor())) { // tensor core v1
       bool isMMAv1Row = dotOperandLayout.getMMAv1IsRow();
       auto srcSharedLayout = src.getType()
                                  .cast<RankedTensorType>()
@@ -671,14 +716,13 @@ private:
     }
     return res;
   }
-}; // namespace triton::gpu::ConvertLayoutOp>
+}; // namespace triton::gpu::ConvertLayoutOp
 
 void populateConvertLayoutOpToLLVMPatterns(
     TritonGPUToLLVMTypeConverter &typeConverter, RewritePatternSet &patterns,
-    int numWarps, AxisInfoAnalysis &axisInfoAnalysis,
-    const Allocation *allocation, Value smem,
+    ModuleAllocation &allocation,
     ConvertTritonGPUOpToLLVMPatternBase::IndexCacheInfo &indexCacheInfo,
     PatternBenefit benefit) {
-  patterns.add<ConvertLayoutOpConversion>(typeConverter, allocation, smem,
+  patterns.add<ConvertLayoutOpConversion>(typeConverter, allocation,
                                           indexCacheInfo, benefit);
 }
