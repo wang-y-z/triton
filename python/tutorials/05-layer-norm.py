@@ -34,13 +34,13 @@ import torch
 import triton
 import triton.language as tl
 
-try:
-    # This is https://github.com/NVIDIA/apex, NOT the apex on PyPi, so it
-    # should not be added to extras_require in setup.py.
-    import apex
-    HAS_APEX = True
-except ModuleNotFoundError:
-    HAS_APEX = False
+# try:
+#     # This is https://github.com/NVIDIA/apex, NOT the apex on PyPi, so it
+#     # should not be added to extras_require in setup.py.
+#     import apex
+#     HAS_APEX = True
+# except ModuleNotFoundError:
+HAS_APEX = False
 
 
 @triton.jit
@@ -365,7 +365,12 @@ def bench_layer_norm(M, N, dtype, provider, mode='backward', eps=1e-5, device='c
 
 
 test_layer_norm(1151, 8192, torch.float16)
-bench_layer_norm.run(save_path='.', print_data=True)
+# bench_layer_norm.run(save_path='.', print_data=True)
+log_file = "/home/scratch.isaacw_gpu/hopper/triton/python/tutorials/"
+func = lambda s: 'A100' if 'Code' in s else 'H100' if 'hopper' in s else None
+log_file = log_file + func(triton.__file__)
+bench_layer_norm.run(print_data=True, show_plots=True, save_path=log_file)
+
 
 # %%
 # References

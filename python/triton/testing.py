@@ -6,6 +6,11 @@ from contextlib import contextmanager
 
 import triton._C.libtriton.triton as _triton
 
+import ScheduleProfiler
+import nvtx  
+profiler = ScheduleProfiler.ScheduleProfiler()
+
+import triton
 
 def nvsmi(attrs):
     attrs = ','.join(attrs)
@@ -84,6 +89,7 @@ def do_bench(fn, warmup=25, rep=100, grad_to_none=None,
         start_event[i].record()
         fn()
         end_event[i].record()
+    
     # Record clocks
     torch.cuda.synchronize()
     times = torch.tensor([s.elapsed_time(e) for s, e in zip(start_event, end_event)])
@@ -221,6 +227,15 @@ class Mark:
                 row_min += [y_min]
                 row_max += [y_max]
             df.loc[len(df)] = [x] + row_mean + row_min + row_max
+        if save_path:
+            func = lambda s: 'A100' if 'Code' in s else 'H100' if 'hopper' in s else None
+            device_str = func(triton.__file__)
+            df.to_csv(
+                os.path.join(
+                    save_path,
+                    f"{device_str}_{bench.plot_name}_all_data.csv"),
+                float_format='%.1f',
+                index=False)
         if bench.plot_name:
             plt.figure()
             ax = plt.subplot()

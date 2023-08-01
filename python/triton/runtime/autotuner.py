@@ -36,6 +36,7 @@ class Autotuner(KernelInterface):
             self.configs = [Config({}, num_warps=4, num_stages=2)]
         else:
             self.configs = configs
+        # breakpoint()
         self.key_idx = [arg_names.index(k) for k in key]
         self.cache = {}
         # hook to reset all required tensor to zeros before relaunching a kernel
@@ -73,9 +74,9 @@ class Autotuner(KernelInterface):
 
         def kernel_call():
             if config.pre_hook:
+                # breakpoint()
                 config.pre_hook(self.nargs)
             self.hook(args)
-            # breakpoint()
             self.fn.run(*args, num_warps=config.num_warps, num_stages=config.num_stages, **current)
         try:
             return do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
@@ -84,6 +85,7 @@ class Autotuner(KernelInterface):
 
     def run(self, *args, **kwargs):
         self.nargs = dict(zip(self.arg_names, args))
+        # breakpoint()
         configs_res = '\n'
         if len(self.configs) > 1:
             all_args = {**self.nargs, **kwargs}
@@ -94,12 +96,14 @@ class Autotuner(KernelInterface):
             key = tuple(_args[i] for i in self.key_idx)
             # breakpoint()
             if key not in self.cache:
-                bench_args = copy.deepcopy(args)
-                # prune configs
-                pruned_configs = self.prune_configs(kwargs)
-                bench_start = time.time()
                 # breakpoint()
-                timings = {config: self._bench(*bench_args, config=config, **kwargs)
+                # bench_args = copy.deepcopy(args)
+                # prune configs
+                # breakpoint()
+                pruned_configs = self.prune_configs(kwargs)
+                assert len(pruned_configs) != 0, "pruned_configs == 0, no Valid config"
+                bench_start = time.time()
+                timings = {config: self._bench(*args, config=config, **kwargs)
                            for config in pruned_configs}
                 bench_end = time.time()
                 sorted_configs = sorted(timings.keys(), key=lambda x: timings[x][1])
@@ -114,6 +118,7 @@ class Autotuner(KernelInterface):
                     configs_res += str(timings[config][1])
                     configs_res += "\n"
                 print("|#| =====================")
+                print("|#| key : ", key)
                 print("|#| [configs bench]", configs_res)
                 self.bench_time = bench_end - bench_start
                 print("|#| bench_time", self.bench_time)

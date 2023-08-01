@@ -263,6 +263,7 @@ def make_hash(fn, arch, **kwargs):
         key = f"{fn.cache_key}-{''.join(signature.values())}-{configs_key}-{constants}-{num_warps}-{num_stages}-{debug}-{arch}"
         return hashlib.md5(key.encode("utf-8")).hexdigest()
     assert isinstance(fn, str)
+    # breakpoint()
     return hashlib.md5((Path(fn).read_text() + triton.runtime.jit.version_key()).encode("utf-8")).hexdigest()
 
 
@@ -362,6 +363,7 @@ def add_cuda_stages(arch, extern_libs, stages):
 
 
 def compile(fn, **kwargs):
+    # breakpoint()
     arch = get_architecture_descriptor(kwargs.get("cc", None))
     is_cuda = _is_cuda(arch)
     context = _triton.ir.context()
@@ -421,6 +423,7 @@ def compile(fn, **kwargs):
     # cache manager
     so_path = make_stub(name, signature, constants)
     # create cache manager
+    # breakpoint()
     fn_cache_manager = get_cache_manager(make_hash(fn, arch, **kwargs))
     # determine name and extension type of provided function
     if isinstance(fn, triton.runtime.JITFunction):
@@ -483,7 +486,9 @@ def compile(fn, **kwargs):
         if ir == "ptx" and ptx_path:
             with open(ptx_path,"r") as f:
                 next_module = f.read()
-        
+        if ir == "ttgir":
+            ttgir_filename = ir_filename
+            # print("###[debug]### ttgir path: ", fn_cache_manager.get_file(ir_filename))
         if ir == "cubin":
             asm[ir] = next_module
         elif ir == "amdgcn":
@@ -504,6 +509,8 @@ def compile(fn, **kwargs):
         fn_cache_manager.put_group(metadata_filename, metadata_group)
 
     # return handle to compiled kernel
+    # breakpoint()
+    print("###[debug]###  constants: ",constants , "ttgir path: ", fn_cache_manager.get_file(ttgir_filename), " so path: ", so_path)
     return CompiledKernel(fn, so_path, metadata, asm)
 
 

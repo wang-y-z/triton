@@ -40,6 +40,7 @@ def is_builtin(fn) -> bool:
 
 
 def _to_tensor(x, builder):
+    # breakpoint()
     if isinstance(x, bool):
         return tensor(builder.get_int1(x), int1)
     # Note: compile-time const integers are represented by unsigned values
@@ -679,6 +680,7 @@ class tensor:
     # ==
     @builtin
     def __eq__(self, other, _builder=None):
+        # breakpoint()
         other = _to_tensor(other, _builder)
         return semantic.equal(self, other, _builder)
 
