@@ -1,10 +1,10 @@
-#include "Utility.h"
+#include "triton/Analysis/Utility.h"
 #include "mlir/Analysis/SliceAnalysis.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
-#include "triton/Analysis/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/Transforms/Utility.h"
 
 namespace mlir {
 
@@ -88,7 +88,7 @@ LogicalResult invertEncoding(Attribute targetEncoding, Operation *op,
   return success();
 }
 
-bool expensiveLoadOrStore(Operation *op, Attribute &targetEncoding) {
+bool isExpensiveLoadOrStore(Operation *op, Attribute &targetEncoding) {
   // Case 1: A size 1 tensor is not expensive since all threads will load the
   // same
   if (isSingleValue(op->getOperand(0)))
@@ -96,22 +96,21 @@ bool expensiveLoadOrStore(Operation *op, Attribute &targetEncoding) {
   // Case 2: Tensor of pointers has more threads than elements
   // we can presume a high hit-rate that makes it cheap to load
   auto ptrType = op->getOperand(0).getType().cast<RankedTensorType>();
-  IntegerAttr numWarps =
-      op->getParentOfType<ModuleOp>()->getAttrOfType<IntegerAttr>(
-          "triton_gpu.num-warps");
-  if (numWarps) {
-    int sizePerThread = triton::gpu::getTotalElemsPerThread(ptrType);
-    if (ptrType.getNumElements() < numWarps.getInt() * 32)
-      return false;
-  }
+  auto mod = op->getParentOfType<ModuleOp>();
+  int numWarps = triton::gpu::TritonGPUDialect::getNumWarps(mod);
+  int threadsPerWarp = triton::gpu::TritonGPUDialect::getThreadsPerWarp(mod);
+  if (ptrType.getNumElements() < numWarps * threadsPerWarp)
+    return false;
   return true;
 }
 
-bool expensiveToRemat(Operation *op, Attribute &targetEncoding) {
+bool isExpensiveToRemat(Operation *op, Attribute &targetEncoding) {
   if (!op)
     return true;
   if (isa<triton::LoadOp, triton::StoreOp>(op))
-    return expensiveLoadOrStore(op, targetEncoding);
+    return isExpensiveLoadOrStore(op, targetEncoding);
+  if (isa<triton::CatOp>(op))
+    return triton::gpu::isExpensiveCat(cast<triton::CatOp>(op), targetEncoding);
   if (isa<tensor::ExtractSliceOp, triton::gpu::AllocTensorOp,
           triton::gpu::InsertSliceAsyncOp, triton::AtomicRMWOp,
           triton::AtomicCASOp, triton::DotOp>(op))
@@ -122,10 +121,12 @@ bool expensiveToRemat(Operation *op, Attribute &targetEncoding) {
   return false;
 }
 
-bool canFoldConversion(Operation *op) {
+bool canFoldConversion(Operation *op, Attribute &targetEncoding) {
+  if (isa<triton::CatOp>(op))
+    return !triton::gpu::isExpensiveCat(cast<triton::CatOp>(op),
+                                        targetEncoding);
   return isa<triton::gpu::ConvertLayoutOp, arith::ConstantOp,
-             triton::MakeRangeOp, triton::SplatOp, triton::ViewOp,
-             triton::CatOp>(*op);
+             triton::MakeRangeOp, triton::SplatOp, triton::ViewOp>(op);
 }
 
 int simulateBackwardRematerialization(
@@ -145,7 +146,7 @@ int simulateBackwardRematerialization(
     queue.pop_back();
     // If the current operation is expensive to rematerialize,
     // we stop everything
-    if (expensiveToRemat(currOp, currLayout))
+    if (isExpensiveToRemat(currOp, currLayout))
       break;
     // A conversion will be removed here (i.e. transferred to operands)
     numCvts -= 1;
@@ -173,7 +174,7 @@ int simulateBackwardRematerialization(
         continue;
       // If the conversion can be folded into opArgI then
       // we don't count this conversion as expensive
-      if (canFoldConversion(opArgI))
+      if (canFoldConversion(opArgI, newEncoding))
         continue;
 
       // We add one expensive conversion for the current operand
@@ -284,7 +285,7 @@ LogicalResult canMoveOutOfLoop(BlockArgument arg,
   // 2. There is only a single conversion
   // 3. Moving this conversion out of the loop will not generate any extra
   // non-removable conversion
-  DenseSet<Type> cvtTypes;
+  SetVector<RankedTensorType> cvtTypes;
   SetVector<Operation *> others;
   auto oldType = arg.getType().cast<RankedTensorType>();
   for (auto user : arg.getUsers()) {
@@ -313,16 +314,34 @@ LogicalResult canMoveOutOfLoop(BlockArgument arg,
     // Second condition
     if (others.empty())
       return success();
-    // Third condition: not complete
+    // Third condition - part 1:
     // If the other or the cvt is in the different block, we cannot push the
     // conversion forward or backward
     for (auto *cvt : cvts) {
       if (cvt->getBlock() != forOp.getBody())
         return failure();
     }
+    auto targetEncoding = cvtTypes.front().getEncoding();
     for (auto *other : others) {
+      // Third condition - part 2:
+      // If the other non-cvt op is in the different block, we cannot push the
+      // conversion forward or backward
       if (other->getBlock() != forOp.getBody())
         return failure();
+      // Third condition - part 3:
+      // %0 (enc1) = cvt %arg (enc0)
+      // other %0 (enc1), %1 (enc0) => other %0 (enc1), %1 (enc1)
+      // Check if %2 (enc1) = cvt %1 (enc0) can be eliminated
+      SetVector<Operation *> processed;
+      SetVector<Attribute> layout;
+      llvm::MapVector<Value, Attribute> toConvert;
+      for (auto operand : other->getOperands()) {
+        auto argOp = operand.getDefiningOp();
+        if (argOp && !isa<triton::gpu::ConvertLayoutOp>(argOp) &&
+            simulateBackwardRematerialization(argOp, processed, layout,
+                                              toConvert, targetEncoding) > 0)
+          return failure();
+      }
     }
     return success();
   }

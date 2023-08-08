@@ -12,19 +12,19 @@ namespace mlir {
 
 class ReduceOpHelper {
 public:
-  explicit ReduceOpHelper(triton::ReduceOp rop)
-      : op(rop.getOperation()), axis(rop.getAxis()) {
-    auto firstTy = rop.getOperands()[0].getType().cast<RankedTensorType>();
+  explicit ReduceOpHelper(triton::ReduceOp op)
+      : op(op.getOperation()), axis(op.getAxis()) {
+    auto firstTy = op.getOperands()[0].getType().cast<RankedTensorType>();
     srcShape = firstTy.getShape();
     srcEncoding = firstTy.getEncoding();
-    srcElementTypes = rop.getElementTypes();
+    srcElementTypes = op.getElementTypes();
 
-    for (const auto &t : rop.getInputTypes()) {
+    for (const auto &t : op.getInputTypes()) {
       if (t.getShape() != srcShape) {
-        rop.emitError() << "shape mismatch";
+        op.emitError() << "shape mismatch";
       }
       if (t.getEncoding() != srcEncoding) {
-        rop.emitError() << "encoding mismatch";
+        op.emitError() << "encoding mismatch";
       }
     }
   }
@@ -33,7 +33,11 @@ public:
 
   Attribute getSrcLayout() { return srcEncoding; }
 
+  triton::ReduceOp getOperation() { return op; }
+
   bool isFastReduction();
+
+  bool isWarpSynchronous();
 
   unsigned getInterWarpSize();
 
@@ -54,11 +58,55 @@ public:
   bool isSupportedLayout();
 
 private:
-  Operation *op;
+  triton::ReduceOp op;
   ArrayRef<int64_t> srcShape;
   Attribute srcEncoding;
   SmallVector<Type> srcElementTypes;
   int axis;
+};
+
+class ScanLoweringHelper {
+public:
+  explicit ScanLoweringHelper(triton::ScanOp op) : scanOp(op) {
+    auto type = scanOp.getOperand(0).getType().cast<RankedTensorType>();
+    srcEncoding = type.getEncoding();
+  }
+  // Return true if the lowering of the scan op is supported.
+  bool isSupported();
+  // Return the number of elements per thread along axis dim.
+  unsigned getAxisNumElementsPerThread();
+  // Return the number of elements per thread along non-axis dims.
+  unsigned getNonAxisNumElementsPerThread();
+  // Return the number of threads per warp along non-axis dims.
+  unsigned getNonAxisNumThreadsPerWarp();
+  // Return the flat numbers of threads computing independent scan results.
+  unsigned getNonAxisNumThreadsPerCTA();
+  // Return the number of warps per CTA along axis dim.
+  unsigned getAxisNumWarps();
+  // Return the number of threads per warp along axis dim.
+  unsigned getAxisNumThreadsPerWarp();
+  // Return the number of blocks along axis dim.
+  unsigned getAxisNumBlocks();
+  // Return the number of blocks along non axis dim.
+  unsigned getNonAxisNumBlocks();
+  // Return the size of the scratch space needed for scan lowering.
+  unsigned getScratchSizeInBytes();
+
+  // Stride between contiguous element along axis dim.
+  unsigned getAxisElementStride();
+  // Stride between contiguous threads along axis dim.
+  unsigned getAxisThreadStride();
+  // Stride between contiguous blocks along axis dim.
+  unsigned getAxisBlockStride();
+
+  Location getLoc() { return scanOp.getLoc(); }
+  unsigned getAxis() { return scanOp.getAxis(); }
+  triton::gpu::BlockedEncodingAttr getEncoding();
+  Region &getCombineOp();
+
+private:
+  triton::ScanOp scanOp;
+  Attribute srcEncoding;
 };
 
 bool maybeSharedAllocationOp(Operation *op);
@@ -69,9 +117,11 @@ bool supportMMA(triton::DotOp op, int version);
 
 bool supportMMA(Value value, int version);
 
-Type getElementType(Value value);
+bool isSingleValue(Value value);
 
-std::string getValueOperandName(Value value, AsmState &state);
+bool isMmaToDotShortcut(RankedTensorType &srcTy, RankedTensorType &dstTy);
+
+Type getElementType(Value value);
 
 template <typename T_OUT, typename T_IN>
 inline SmallVector<T_OUT> convertType(ArrayRef<T_IN> in) {
@@ -87,7 +137,7 @@ template <typename Int> Int product(llvm::ArrayRef<Int> arr) {
 
 template <typename Int> Int ceil(Int m, Int n) { return (m + n - 1) / n; }
 
-// output[i] = input[order[i]]
+/// output[i] = input[order[i]]
 template <typename T, typename RES_T = T>
 SmallVector<RES_T> reorder(ArrayRef<T> input, ArrayRef<unsigned> order) {
   size_t rank = order.size();
@@ -99,6 +149,7 @@ SmallVector<RES_T> reorder(ArrayRef<T> input, ArrayRef<unsigned> order) {
   return result;
 }
 
+/// Get the highest power of 2 divisor of an integer.
 template <typename T> T highestPowOf2Divisor(T n) {
   if (n == 0) {
     return (static_cast<T>(1) << (sizeof(T) * 8 - 2));
@@ -106,9 +157,18 @@ template <typename T> T highestPowOf2Divisor(T n) {
   return (n & (~(n - 1)));
 }
 
-bool isSingleValue(Value value);
-
-bool isMmaToDotShortcut(RankedTensorType &srcTy, RankedTensorType &dstTy);
+/// Get the next power of 2 for an integer (or the integer itself if it is a
+/// power of 2).
+template <typename T> T nextPowOf2(T n) {
+  if (n == 0) {
+    return 1;
+  }
+  n--;
+  for (unsigned i = 1; i < sizeof(T) * 8; i <<= 1) {
+    n |= n >> i;
+  }
+  return n + 1;
+}
 
 /// Multi-root DAG topological sort.
 /// Performs a topological sort of the Operation in the `toSort` SetVector.

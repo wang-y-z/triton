@@ -22,6 +22,7 @@ endif()
 # Options
 option(TRITON_BUILD_TUTORIALS "Build C++ Triton tutorials" ON)
 option(TRITON_BUILD_PYTHON_MODULE "Build Python Triton bindings" OFF)
+set(TRITON_CODEGEN_BACKENDS "" CACHE STRING "Enable different codegen backends")
 
 # Ensure Python3 vars are set correctly
 # used conditionally in this file and by lit tests
@@ -85,59 +86,59 @@ if(NOT MLIR_DIR)
   else()
     set(LLVM_LDFLAGS "-L${LLVM_LIBRARY_DIR}")
     set(LLVM_LIBRARIES
-      libLLVMNVPTXCodeGen.a
-      libLLVMNVPTXDesc.a
-      libLLVMNVPTXInfo.a
-      libLLVMAMDGPUDisassembler.a
-      libLLVMMCDisassembler.a
-      libLLVMAMDGPUCodeGen.a
-      libLLVMMIRParser.a
-      libLLVMGlobalISel.a
-      libLLVMSelectionDAG.a
-      libLLVMipo.a
-      libLLVMInstrumentation.a
-      libLLVMVectorize.a
-      libLLVMLinker.a
-      libLLVMIRReader.a
-      libLLVMAsmParser.a
-      libLLVMFrontendOpenMP.a
-      libLLVMAsmPrinter.a
-      libLLVMDebugInfoDWARF.a
-      libLLVMCodeGen.a
-      libLLVMTarget.a
-      libLLVMScalarOpts.a
-      libLLVMInstCombine.a
-      libLLVMAggressiveInstCombine.a
-      libLLVMTransformUtils.a
-      libLLVMBitWriter.a
-      libLLVMAnalysis.a
-      libLLVMProfileData.a
-      libLLVMObject.a
-      libLLVMTextAPI.a
-      libLLVMBitReader.a
-      libLLVMAMDGPUAsmParser.a
-      libLLVMMCParser.a
-      libLLVMAMDGPUDesc.a
-      libLLVMAMDGPUUtils.a
-      libLLVMMC.a
-      libLLVMDebugInfoCodeView.a
-      libLLVMDebugInfoMSF.a
-      libLLVMCore.a
-      libLLVMRemarks.a
-      libLLVMBitstreamReader.a
-      libLLVMBinaryFormat.a
-      libLLVMAMDGPUInfo.a
-      libLLVMSupport.a
-      libLLVMDemangle.a
-      libLLVMPasses.a
-      libLLVMAnalysis.a
-      libLLVMTransformUtils.a
-      libLLVMScalarOpts.a
-      libLLVMTransformUtils.a
-      libLLVMipo.a
-      libLLVMObjCARCOpts.a
-      libLLVMCoroutines.a
-      libLLVMAnalysis.a
+      LLVMNVPTXCodeGen
+      LLVMNVPTXDesc
+      LLVMNVPTXInfo
+      LLVMAMDGPUDisassembler
+      LLVMMCDisassembler
+      LLVMAMDGPUCodeGen
+      LLVMMIRParser
+      LLVMGlobalISel
+      LLVMSelectionDAG
+      LLVMipo
+      LLVMInstrumentation
+      LLVMVectorize
+      LLVMLinker
+      LLVMIRReader
+      LLVMAsmParser
+      LLVMFrontendOpenMP
+      LLVMAsmPrinter
+      LLVMDebugInfoDWARF
+      LLVMCodeGen
+      LLVMTarget
+      LLVMScalarOpts
+      LLVMInstCombine
+      LLVMAggressiveInstCombine
+      LLVMTransformUtils
+      LLVMBitWriter
+      LLVMAnalysis
+      LLVMProfileData
+      LLVMObject
+      LLVMTextAPI
+      LLVMBitReader
+      LLVMAMDGPUAsmParser
+      LLVMMCParser
+      LLVMAMDGPUDesc
+      LLVMAMDGPUUtils
+      LLVMMC
+      LLVMDebugInfoCodeView
+      LLVMDebugInfoMSF
+      LLVMCore
+      LLVMRemarks
+      LLVMBitstreamReader
+      LLVMBinaryFormat
+      LLVMAMDGPUInfo
+      LLVMSupport
+      LLVMDemangle
+      LLVMPasses
+      LLVMAnalysis
+      LLVMTransformUtils
+      LLVMScalarOpts
+      LLVMTransformUtils
+      LLVMipo
+      LLVMObjCARCOpts
+      LLVMCoroutines
+      LLVMAnalysis
     )
   endif()
 
@@ -215,6 +216,7 @@ if(TRITON_BUILD_PYTHON_MODULE)
     ${conversion_libs}
 
     # optimizations
+    MLIRBytecodeWriter
     MLIRPass
     MLIRTransforms
     MLIRLLVMDialect
@@ -260,6 +262,14 @@ if(TRITON_BUILD_PYTHON_MODULE AND NOT WIN32)
   endif()
 
   target_link_libraries(triton ${CUTLASS_LIBRARIES} ${PYTHON_LDFLAGS})
+endif()
+
+list(LENGTH TRITON_CODEGEN_BACKENDS CODEGEN_BACKENDS_LEN)
+if (${CODEGEN_BACKENDS_LEN} GREATER 0)
+  set(PYTHON_THIRD_PARTY_PATH ${CMAKE_CURRENT_SOURCE_DIR}/python/triton/third_party)
+  foreach(CODEGEN_BACKEND ${TRITON_CODEGEN_BACKENDS})
+    add_subdirectory(third_party/${CODEGEN_BACKEND})
+  endforeach()
 endif()
 
 add_subdirectory(test)

@@ -402,11 +402,40 @@ tt.func @permute_2d(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: i32
 
 // -----
 
+// CHECK-LABEL: @load_constancy
+tt.func @load_constancy(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: i32 {tt.divisibility = 1 : i32}) {
+  // CHECK: divisibility = [16]
+  %sixteen = arith.constant dense<16> : tensor<1024xi32>
+  // CHECK-NEXT: divisibility = [8]
+  %eight = arith.constant dense<8> : tensor<1024xi32>
+  // CHECK-NEXT: contiguity = [1024], divisibility = [1073741824], constancy = [1]
+  %1 = tt.make_range {end = 1024 : i32, start = 0 : i32} : tensor<1024xi32>
+  // CHECK-NEXT: constancy = [16]
+  %2 = arith.divsi %1, %sixteen : tensor<1024xi32>
+  // CHECK-NEXT: constancy = [1024]
+  %3 = tt.splat %arg0 : (!tt.ptr<f32>) -> tensor<1024x!tt.ptr<f32>>
+  // CHECK-NEXT: constancy = [1024]
+  %4 = tt.splat %arg1 : (i32) -> tensor<1024xi32>
+  // CHECK-NEXT: constancy = [8]
+  %5 = arith.divsi %1, %eight : tensor<1024xi32>
+  // CHECK-NEXT: constancy = [8]
+  %6 = arith.cmpi slt, %5, %4 : tensor<1024xi32>
+  // CHECK-NEXT: constancy = [16]
+  %7 = tt.addptr %3, %2 : tensor<1024x!tt.ptr<f32>>, tensor<1024xi32>
+  // CHECK-NEXT: constancy = [16]
+  %8 = tt.load %7 {cache = 1 : i32, evict = 1 : i32, isVolatile = false} : tensor<1024xf32>
+  // CHECK-NEXT: constancy = [8]
+  %9 = tt.load %7, %6 {cache = 1 : i32, evict = 1 : i32, isVolatile = false} : tensor<1024xf32>
+  tt.return
+}
+
+// -----
+
 // This is a tiny test for verifying StoreOp-related alignment, It simply store a constant to a buffer.
 // CHECK-LABEL: @store_constant_align
 tt.func @store_constant_align(%addr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %n: i32 {tt.divisibility = 16 : i32}) {
   // CHECK: contiguity = [1], divisibility = [1], constancy = [1], constant_value = <none>
-  %pid = tt.get_program_id {axis = 0 : i32} : i32
+  %pid = tt.get_program_id x : i32
   // CHECK-NEXT: contiguity = [1], divisibility = [128], constancy = [1], constant_value = 128
   %c128_i32 = arith.constant 128 : i32
   // CHECK-NEXT: contiguity = [1], divisibility = [128], constancy = [1], constant_value = <none>
@@ -438,7 +467,7 @@ tt.func @store_constant_align(%addr: !tt.ptr<f32> {tt.divisibility = 16 : i32}, 
 // CHECK-LABEL: @vecadd_mask_align_16
 tt.func @vecadd_mask_align_16(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %n_elements: i32 {tt.divisibility = 16 : i32}) {
   %c64_i32 = arith.constant 64 : i32
-  %0 = tt.get_program_id {axis = 0 : i32} : i32
+  %0 = tt.get_program_id x : i32
   %1 = arith.muli %0, %c64_i32 : i32
   %2 = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>
   %3 = tt.splat %1 : (i32) -> tensor<64xi32>
@@ -467,7 +496,7 @@ tt.func @vecadd_mask_align_16(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, 
 // CHECK-LABEL: @vecadd_mask_align_1
 tt.func @vecadd_mask_align_1(%arg0: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg1: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %arg2: !tt.ptr<f32> {tt.divisibility = 16 : i32}, %n_elements: i32) {
   %c64_i32 = arith.constant 64 : i32
-  %0 = tt.get_program_id {axis = 0 : i32} : i32
+  %0 = tt.get_program_id x : i32
   %1 = arith.muli %0, %c64_i32 : i32
   %2 = tt.make_range {end = 64 : i32, start = 0 : i32} : tensor<64xi32>
   %3 = tt.splat %1 : (i32) -> tensor<64xi32>

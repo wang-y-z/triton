@@ -72,6 +72,14 @@ static PyObject *loadBinary(PyObject *self, PyObject *args) {
   // int count = 0;
   // printf("@ 0000 debug %d\n", count++);
   // printf("%s\n", data);
+
+  CUcontext pctx = 0;
+  CUDA_CHECK(cuCtxGetCurrent(&pctx));
+  if (!pctx) {
+    CUDA_CHECK(cuDevicePrimaryCtxRetain(&pctx, device));
+    CUDA_CHECK(cuCtxSetCurrent(pctx));
+  }
+
   CUDA_CHECK(cuModuleLoadData(&mod, data));
   // printf("@@@ debug %d\n", count++);
   CUDA_CHECK(cuModuleGetFunction(&fun, mod, name));

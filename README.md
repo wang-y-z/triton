@@ -25,12 +25,12 @@ You can install the latest stable release of Triton from pip:
 ```bash
 pip install triton
 ```
-Binary wheels are available for CPython 3.6-3.11 and PyPy 3.7-3.9.
+Binary wheels are available for CPython 3.7-3.11 and PyPy 3.8-3.9.
 
 And the latest nightly release:
 
 ```bash
-pip install -U --pre triton
+pip install -U --index-url https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/Triton-Nightly/pypi/simple/ triton-nightly
 ```
 
 # Install from source
@@ -41,6 +41,8 @@ cd triton/python;
 pip install cmake; # build-time dependency
 pip install -e .
 ```
+
+
 
 # Changelog
 
@@ -55,6 +57,9 @@ Version 2.0 is out! New features include:
 Community contributions are more than welcome, whether it be to fix bugs or to add new features at [github](https://github.com/openai/triton/). For more detailed instructions, please visit our [contributor's guide](CONTRIBUTING.md).
 
 If you’re interested in joining our team and working on Triton & GPU kernels, [we’re hiring](https://openai.com/jobs/#acceleration)!
+
+
+
 
 # Compatibility
 

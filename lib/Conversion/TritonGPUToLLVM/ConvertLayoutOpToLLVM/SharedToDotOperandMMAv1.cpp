@@ -107,7 +107,7 @@ static Value loadA(Value tensor, const SharedMemoryObject &smemObj,
   auto order = sharedLayout.getOrder();
 
   Value cSwizzleOffset = smemObj.getCSwizzleOffset(order[0]);
-  Value smemBase = smemObj.getBaseBeforeSwizzle(order[0], loc, rewriter);
+  Value smemBase = smemObj.getBaseBeforeSlice(order[0], loc, rewriter);
 
   bool isARow = order[0] != 0;
   auto resultEncoding = resultTy.cast<RankedTensorType>()
@@ -232,7 +232,7 @@ static Value loadB(Value tensor, const SharedMemoryObject &smemObj,
   auto shape = tensorTy.getShape();
   auto order = sharedLayout.getOrder();
 
-  Value smem = smemObj.getBaseBeforeSwizzle(order[0], loc, rewriter);
+  Value smem = smemObj.getBaseBeforeSlice(order[0], loc, rewriter);
   bool isBRow = order[0] != 0; // is row-major in shared memory layout
   // isBRow_ indicates whether B is row-major in DotOperand layout
   auto resultEncoding = resultTy.cast<RankedTensorType>()
@@ -339,7 +339,7 @@ namespace SharedToDotOperandMMAv1 {
 using CoordTy = SmallVector<Value>;
 using ValueTable = std::map<std::pair<int, int>, std::pair<Value, Value>>;
 
-SmallVector<CoordTy> getMNCoords(Value thread,
+SmallVector<CoordTy> getMNCoords(Value thread, Location loc,
                                  ConversionPatternRewriter &rewriter,
                                  ArrayRef<unsigned int> wpt,
                                  const MmaEncodingAttr &mmaLayout,
@@ -348,7 +348,6 @@ SmallVector<CoordTy> getMNCoords(Value thread,
   static constexpr std::array<int, 3> fpw{{2, 2, 1}};
 
   auto *ctx = thread.getContext();
-  auto loc = UnknownLoc::get(ctx);
   Value _1 = i32_val(1);
   Value _2 = i32_val(2);
   Value _4 = i32_val(4);
