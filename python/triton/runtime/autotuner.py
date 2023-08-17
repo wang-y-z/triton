@@ -90,6 +90,7 @@ class Autotuner(KernelInterface):
 
     def run(self, *args, **kwargs):
         self.nargs = dict(zip(self.arg_names, args))
+        configs_res = '\n'
         if len(self.configs) > 1:
             all_args = {**self.nargs, **kwargs}
             _args = []
@@ -100,10 +101,28 @@ class Autotuner(KernelInterface):
             if key not in self.cache:
                 # prune configs
                 pruned_configs = self.prune_configs(kwargs)
+                assert len(pruned_configs) != 0, "pruned_configs == 0, no Valid config"
                 bench_start = time.time()
                 timings = {config: self._bench(*args, config=config, **kwargs)
                            for config in pruned_configs}
                 bench_end = time.time()
+                sorted_configs = sorted(timings.keys(), key=lambda x: timings[x][1])
+                number_top = 1
+                for config in sorted_configs:
+                    configs_res += "|#| top" 
+                    configs_res += str(number_top) if number_top <= 5 else "N"
+                    configs_res += " "
+                    number_top += 1
+                    configs_res += config.__str__()
+                    configs_res += "    "
+                    configs_res += str(timings[config][1])
+                    configs_res += "\n"
+                print("|#| =====================")
+                print("|#| key : ", key)
+                print("|#| [configs bench]", configs_res)
+                self.bench_time = bench_end - bench_start
+                print("|#| bench_time", self.bench_time)
+                print("|#| =====================")
                 self.bench_time = bench_end - bench_start
                 self.cache[key] = builtins.min(timings, key=timings.get)
                 self.hook(args)

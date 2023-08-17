@@ -412,6 +412,8 @@ def compile(fn, **kwargs):
     num_warps = kwargs.get("num_warps", 4)
     num_ctas = kwargs.get("num_ctas", 1)
     num_stages = kwargs.get("num_stages", 3 if is_cuda and arch >= 75 else 2)
+    print("### [compile] +++  constants:",constants," num_warps:",num_warps," num_ctas:",num_ctas)
+
     # TODO[shuhaoj]: Default should be to enable warp specialization once possible
     enable_warp_specialization = kwargs.get("enable_warp_specialization", False)
     # TODO[shuhaoj]: persistent can be decoupled with warp specialization
@@ -547,7 +549,8 @@ def compile(fn, **kwargs):
                     next_module = (parse(path), parse(hasco_path))
                 else:
                     next_module = parse(path)
-
+        if ir_name == "ttgir":
+            ttgir_filename = ir_filename   
         if ir_name == "cubin":
             asm[ir_name] = next_module
         elif ir_name == "amdgcn":
@@ -600,6 +603,7 @@ def compile(fn, **kwargs):
     fn_cache_manager.put_group(metadata_filename, metadata_group)
 
     # return handle to compiled kernel
+    print("### [compile] ---  constants:",constants,"ttgir path: ", fn_cache_manager.get_file(ttgir_filename), " so path: ", so_path)
     return CompiledKernel(fn, so_path, metadata, asm)
 
 
