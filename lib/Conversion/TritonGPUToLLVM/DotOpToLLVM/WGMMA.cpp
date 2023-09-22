@@ -21,8 +21,8 @@
  * SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
  */
 
-#include "DotOpToLLVM.h"
-#include "Utility.h"
+#include "../DotOpToLLVM.h"
+#include "../Utility.h"
 
 using namespace mlir;
 using namespace mlir::triton;
@@ -58,7 +58,7 @@ triton::nvgpu::WGMMAEltType getMmaOperandType(Value a, bool allowTF32) {
     return triton::nvgpu::WGMMAEltType::s8;
   } else if (aTy.isFloat8E5M2()) {
     return triton::nvgpu::WGMMAEltType::e5m2;
-  } else if (aTy.isFloat8E4M3FN()) {
+  } else if (aTy.isFloat8E4M3FNUZ()) {
     return triton::nvgpu::WGMMAEltType::e4m3;
   } else {
     llvm::report_fatal_error("Unsupported mma operand type found");
@@ -115,7 +115,7 @@ public:
     mode = getModeFromLayout(sharedLayout, widthInByte);
 
     baseDesc = rewriter.create<triton::nvgpu::WGMMADescCreateOp>(
-        loc, i64_ty, base, i32_val(shape[ord[1]]), mode);
+        loc, base, i32_val(shape[ord[1]]), mode);
   }
 
   Value smemLoad(int a, int b) {
@@ -260,11 +260,42 @@ SmallVector<Value> unpackAccumulator(ConversionPatternRewriter &rewriter,
   return results;
 }
 
+static bool isFP8(triton::nvgpu::WGMMAEltType eltType) {
+  return eltType == triton::nvgpu::WGMMAEltType::e5m2 ||
+         eltType == triton::nvgpu::WGMMAEltType::e4m3;
+}
+
+static Value faddAccumulate(ConversionPatternRewriter &rewriter, Location loc,
+                            Value a, Value b) {
+  int numEl = a.getType().cast<LLVM::LLVMStructType>().getBody().size();
+  Value newStruct = rewriter.create<LLVM::UndefOp>(loc, a.getType());
+  for (int i = 0; i < numEl; ++i) {
+    Value lhs = rewriter.create<LLVM::ExtractValueOp>(loc, a, i);
+    Value rhs = rewriter.create<LLVM::ExtractValueOp>(loc, b, i);
+    Value add = rewriter.create<LLVM::FAddOp>(loc, lhs, rhs);
+    newStruct = rewriter.create<LLVM::InsertValueOp>(loc, newStruct, add, i);
+  }
+  return newStruct;
+}
+
+static bool isZero(Value v) {
+  auto constantOp = v.getDefiningOp<arith::ConstantOp>();
+  if (!constantOp)
+    return false;
+  if (auto denseAttr = dyn_cast<DenseFPElementsAttr>(constantOp.getValueAttr()))
+    return denseAttr.isSplat() && denseAttr.getSplatValue<APFloat>().isZero();
+  if (auto denseAttr =
+          dyn_cast<DenseIntElementsAttr>(constantOp.getValueAttr()))
+    return denseAttr.isSplat() && denseAttr.getSplatValue<APInt>().isZero();
+  return false;
+}
+
 LogicalResult convertDot(TritonGPUToLLVMTypeConverter *typeConverter,
                          ConversionPatternRewriter &rewriter, Location loc,
                          Operation *op, Value a, Value b, Value c, Value d,
                          Value loadedA, Value loadedB, Value loadedC,
-                         bool allowTF32, const SharedMemoryObject &smemObjA,
+                         bool allowTF32, uint32_t maxNumImpreciseAcc,
+                         const SharedMemoryObject &smemObjA,
                          const SharedMemoryObject &smemObjB, bool sync,
                          Value thread) {
   auto aTensorTy = a.getType().cast<RankedTensorType>();
@@ -283,7 +314,7 @@ LogicalResult convertDot(TritonGPUToLLVMTypeConverter *typeConverter,
   int M = 4 * instrShape[0];
   int N = instrShape[1];
   int K = instrShape[2];
-
+  bool zeroAcc = isZero(c);
   auto shapePerCTATile = getShapePerCTATile(mmaEncoding);
   int numRepM = ceil<unsigned>(dShapePerCTA[0], shapePerCTATile[0]);
   int numRepN = ceil<unsigned>(dShapePerCTA[1], shapePerCTATile[1]);
@@ -298,7 +329,7 @@ LogicalResult convertDot(TritonGPUToLLVMTypeConverter *typeConverter,
 
   triton::nvgpu::WGMMAEltType eltTypeC = getMmaRetType(d);
   triton::nvgpu::WGMMAEltType eltTypeA = getMmaOperandType(a, allowTF32);
-  triton::nvgpu::WGMMAEltType eltTypeB = eltTypeA;
+  triton::nvgpu::WGMMAEltType eltTypeB = getMmaOperandType(b, allowTF32);
 
   triton::nvgpu::WGMMALayout layoutA = transA ? triton::nvgpu::WGMMALayout::col
                                               : triton::nvgpu::WGMMALayout::row;
@@ -311,7 +342,10 @@ LogicalResult convertDot(TritonGPUToLLVMTypeConverter *typeConverter,
   if (numTMADescs == 0)
     rewriter.create<triton::nvgpu::FenceAsyncSharedOp>(loc, 0);
   rewriter.create<triton::nvgpu::WGMMAFenceOp>(loc);
-
+  // WGMMA fp8 -> fp32 accumulates in lower precision than fp32.
+  bool needsPartialAccumulator = isFP8(eltTypeA) &&
+                                 eltTypeC == triton::nvgpu::WGMMAEltType::f32 &&
+                                 maxNumImpreciseAcc <= aTensorTy.getShape()[1];
   SmallVector<Value> mmaResults;
   for (int m = 0; m < numRepM; ++m) {
     for (int n = 0; n < numRepN; ++n) {
@@ -322,14 +356,36 @@ LogicalResult convertDot(TritonGPUToLLVMTypeConverter *typeConverter,
         elemTypes.push_back(accEl.getType());
       auto accTy =
           LLVM::LLVMStructType::getLiteral(rewriter.getContext(), elemTypes);
-      Value d = typeConverter->packLLElements(loc, mmaOut, rewriter, accTy);
+      Value d;
+      if (!zeroAcc)
+        d = typeConverter->packLLElements(loc, mmaOut, rewriter, accTy);
+      uint32_t numLowPrecisionAcc = 0;
+      Value partialAcc;
       for (int k = 0; k < numRepK; ++k) {
         auto a = aLoader.smemLoad(m, k);
         auto b = bLoader.smemLoad(n, k);
         ValueRange operands{a, b, d};
-        d = rewriter.create<triton::nvgpu::WGMMAOp>(loc, accTy, a, b, d, M, N,
-                                                    K, eltTypeC, eltTypeA,
-                                                    eltTypeB, layoutA, layoutB);
+        numLowPrecisionAcc += K;
+        // If using native accumulation would cause use to do more low precion
+        // accumulation than allowed do a separate allocation.
+        bool requireAddAccumulator =
+            needsPartialAccumulator &&
+            (numLowPrecisionAcc >= maxNumImpreciseAcc || k == numRepK - 1);
+        Value mmaAcc = needsPartialAccumulator ? partialAcc : d;
+        mmaAcc = rewriter.create<triton::nvgpu::WGMMAOp>(
+            loc, accTy, a, b, mmaAcc, M, N, K, eltTypeC, eltTypeA, eltTypeB,
+            layoutA, layoutB);
+        if (needsPartialAccumulator)
+          partialAcc = mmaAcc;
+        else
+          d = mmaAcc;
+        // If we need accumulate separately to have higer precision, insert
+        // adds.
+        if (requireAddAccumulator) {
+          d = faddAccumulate(rewriter, loc, d, partialAcc);
+          numLowPrecisionAcc = 0;
+          partialAcc = Value();
+        }
       }
       auto acc = typeConverter->unpackLLElements(loc, d, rewriter, accTy);
       for (int i = 0; i < acc.size(); ++i) {
@@ -398,8 +454,9 @@ LogicalResult convertWGMMA(triton::DotOp op, triton::DotOp::Adaptor adaptor,
   auto smemObjA = getSharedMemoryObjectFromStruct(loc, llA, rewriter);
   auto smemObjB = getSharedMemoryObjectFromStruct(loc, llB, rewriter);
   return convertDot(typeConverter, rewriter, loc, op.getOperation(), A, B, C,
-                    op.getD(), llA, llB, llC, op.getAllowTF32(), smemObjA,
-                    smemObjB, true, thread);
+                    op.getD(), llA, llB, llC, op.getAllowTF32(),
+                    op.getMaxNumImpreciseAcc(), smemObjA, smemObjB, true,
+                    thread);
 }
 
 LogicalResult convertAsyncWGMMA(triton::nvidia_gpu::DotAsyncOp op,
@@ -426,6 +483,7 @@ LogicalResult convertAsyncWGMMA(triton::nvidia_gpu::DotAsyncOp op,
   auto smemObjA = getSharedMemoryObjectFromStruct(loc, llA, rewriter);
   auto smemObjB = getSharedMemoryObjectFromStruct(loc, llB, rewriter);
   return convertDot(typeConverter, rewriter, loc, op.getOperation(), A, B, C,
-                    op.getD(), llA, llB, llC, op.getAllowTF32(), smemObjA,
-                    smemObjB, false, thread);
+                    op.getD(), llA, llB, llC, op.getAllowTF32(),
+                    op.getMaxNumImpreciseAcc(), smemObjA, smemObjB, false,
+                    thread);
 }
