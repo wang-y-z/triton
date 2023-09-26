@@ -17,6 +17,7 @@ import torch
 import triton
 import triton.language as tl
 
+from triton_flashattention_v1 import _attention_v1
 
 @triton.jit
 def _attn_fwd_inner(
@@ -509,6 +510,7 @@ class _attention(torch.autograd.Function):
 
 
 attention = _attention.apply
+attention_v1 = _attention_v1.apply
 
 
 @pytest.mark.parametrize("Z, H, N_CTX, D_HEAD", [(1, 2, 1024, 64)])
@@ -555,6 +557,17 @@ def test_op(Z, H, N_CTX, D_HEAD, causal, dtype=torch.float16):
     assert torch.allclose(ref_dv, tri_dv, atol=1e-2, rtol=0)
     assert torch.allclose(ref_dk, tri_dk, atol=1e-2, rtol=0)
     assert torch.allclose(ref_dq, tri_dq, atol=1e-2, rtol=0)
+    
+    tri_out = attention_v1(q, k, v, causal, sm_scale).half()
+    tri_out.backward(dout)
+    tri_dv, v.grad = v.grad.clone(), None
+    tri_dk, k.grad = k.grad.clone(), None
+    tri_dq, q.grad = q.grad.clone(), None
+    # compare
+    assert torch.allclose(ref_out, tri_out, atol=1e-2, rtol=0)
+    assert torch.allclose(ref_dv, tri_dv, atol=1e-2, rtol=0)
+    assert torch.allclose(ref_dk, tri_dk, atol=1e-2, rtol=0)
+    assert torch.allclose(ref_dq, tri_dq, atol=1e-2, rtol=0)
 
 
 try:
@@ -571,10 +584,13 @@ configs = [
         x_names=["N_CTX"],
         x_vals=[2**i for i in range(10, 15)],
         line_arg="provider",
-        line_vals=["triton"] + (["flash"] if HAS_FLASH else []),
-        line_names=["Triton"] + (["Flash-2"] if HAS_FLASH else []),
-        styles=[("red", "-"), ("blue", "-")],
-        ylabel="ms",
+        # line_vals=(["flash"] if HAS_FLASH else []),
+        # line_names=(["Flash-2"] if HAS_FLASH else []),
+        # styles=[("blue", "-")],
+        line_vals=["triton_v1"] + ["triton_v2"] + (["flash"] if HAS_FLASH else []),
+        line_names=["Triton_v1"] + ["Triton_v2"] + (["Flash-2"] if HAS_FLASH else []),
+        styles=[("green", "-"),("red", "-"), ("blue", "-")],
+        ylabel="throughput",
         plot_name=f"fused-attention-batch{BATCH}-head{N_HEADS}-d{D_HEAD}-{mode}",
         args={
             "H": N_HEADS,
@@ -597,7 +613,18 @@ def bench_flash_attention(
     assert mode in ["fwd", "bwd"]
     warmup = 25
     rep = 100
-    if provider == "triton":
+    if provider == "triton_v1":
+        q = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
+        k = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
+        v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
+        sm_scale = 1.3
+        fn = lambda: attention_v1(q, k, v, causal, sm_scale)
+        if mode == "bwd":
+            o = fn()
+            do = torch.randn_like(o)
+            fn = lambda: o.backward(do, retain_graph=True)
+        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+    if provider == "triton_v2":
         q = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
         k = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
         v = torch.randn((BATCH, H, N_CTX, D_HEAD), dtype=dtype, device="cuda", requires_grad=True)
@@ -618,8 +645,10 @@ def bench_flash_attention(
             do = torch.randn_like(o)
             fn = lambda: o.backward(do, retain_graph=True)
         ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+    print(provider, "latency : ",BATCH, H, N_CTX, D_HEAD, ms)
     flops_per_matmul = 2.0 * BATCH * H * N_CTX * N_CTX * D_HEAD
     total_flops = 2 * flops_per_matmul
+    # print("!!!",causal)
     if causal:
         total_flops *= 0.5
     if mode == "bwd":
