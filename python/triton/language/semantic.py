@@ -9,6 +9,13 @@ from . import core as tl
 
 T = TypeVar('T')
 
+# TODO: redundant code -- remove after 3P backend refactor
+
+
+def _is_cuda(target):
+    from ..compiler.compiler import CudaTargetDescriptor
+    return isinstance(target, CudaTargetDescriptor)
+
 # Create custom exception that prints message "hello"
 
 
@@ -681,11 +688,6 @@ def bitcast(input: tl.tensor,
                      dst_ty)
 
 
-# TODO: architecture descriptor class
-def _is_cuda(arch):
-    return isinstance(arch, int)
-
-
 def cast(input: tl.tensor,
          dst_ty: tl.dtype,
          builder: ir.builder) -> tl.tensor:
@@ -700,7 +702,7 @@ def cast(input: tl.tensor,
     src_sca_ty = src_ty.scalar
     dst_sca_ty = dst_ty.scalar
 
-    if _is_cuda(builder.arch) and builder.arch < 89 and \
+    if _is_cuda(builder.target) and builder.target.capability < 89 and \
        (src_sca_ty.is_fp8e4nv() or dst_sca_ty.is_fp8e4nv()):
         assert False, "fp8e4nv data type is not supported on CUDA arch < 89"
 
@@ -869,6 +871,20 @@ def _str_to_sem(sem_option):
         else:
             raise ValueError(f"Memory semantic {sem_option} not supported")
     return sem
+
+
+def _str_to_scope(scope_option):
+    scope = ir.MEM_SYNC_SCOPE.GPU
+    if scope_option:
+        if scope_option == "gpu":
+            scope = ir.MEM_SYNC_SCOPE.GPU
+        elif scope_option == "cta":
+            scope = ir.MEM_SYNC_SCOPE.CTA
+        elif scope_option == "sys":
+            scope = ir.MEM_SYNC_SCOPE.SYSTEM
+        else:
+            raise ValueError(f"Memory semantic {scope_option} not supported")
+    return scope
 
 
 def _canonicalize_boundary_check(boundary_check, block_shape):
@@ -1082,12 +1098,14 @@ def atomic_cas(ptr: tl.tensor,
                cmp: tl.tensor,
                val: tl.tensor,
                sem: str,
+               scope: str,
                builder: ir.builder) -> tl.tensor:
     sem = _str_to_sem(sem)
+    scope = _str_to_scope(scope)
     element_ty = ptr.type.scalar.element_ty
     if element_ty.primitive_bitwidth not in [16, 32, 64]:
         raise ValueError("atomic_cas only supports elements with width {16, 32, 64}")
-    return tl.tensor(builder.create_atomic_cas(ptr.handle, cmp.handle, val.handle, sem), val.type)
+    return tl.tensor(builder.create_atomic_cas(ptr.handle, cmp.handle, val.handle, sem, scope), val.type)
 
 
 def atom_red_typechecking_impl(ptr: tl.tensor,
@@ -1122,9 +1140,11 @@ def atomic_max(ptr: tl.tensor,
                val: tl.tensor,
                mask: tl.tensor,
                sem: str,
+               scope: str,
                builder: ir.builder) -> tl.tensor:
     ptr, val, mask = atom_red_typechecking_impl(ptr, val, mask, 'max', builder)
     sem = _str_to_sem(sem)
+    scope = _str_to_scope(scope)
     sca_ty = val.type.scalar
     # direct call to atomic_max for integers
     if sca_ty.is_int():
@@ -1133,14 +1153,16 @@ def atomic_max(ptr: tl.tensor,
                                                        ptr.handle,
                                                        val.handle,
                                                        mask.handle,
-                                                       sem),
+                                                       sem,
+                                                       scope),
                              val.type)
         else:
             return tl.tensor(builder.create_atomic_rmw(ir.ATOMIC_OP.UMAX,
                                                        ptr.handle,
                                                        val.handle,
                                                        mask.handle,
-                                                       sem),
+                                                       sem,
+                                                       scope),
                              val.type)
     # for float
     # return atomic_smax(i_ptr, i_val) if val >= 0
@@ -1155,8 +1177,8 @@ def atomic_max(ptr: tl.tensor,
     i_ptr = bitcast(ptr, tl.pointer_type(itype, 1), builder)
     pos = greater_equal(val, zero, builder)
     neg = less_than(val, zero, builder)
-    pos_ret = tl.tensor(builder.create_atomic_rmw(ir.ATOMIC_OP.MAX, i_ptr.handle, i_val.handle, and_(mask, pos, builder).handle, sem), i_val.type)
-    neg_ret = tl.tensor(builder.create_atomic_rmw(ir.ATOMIC_OP.UMIN, i_ptr.handle, i_val.handle, and_(mask, neg, builder).handle, sem), i_val.type)
+    pos_ret = tl.tensor(builder.create_atomic_rmw(ir.ATOMIC_OP.MAX, i_ptr.handle, i_val.handle, and_(mask, pos, builder).handle, sem, scope), i_val.type)
+    neg_ret = tl.tensor(builder.create_atomic_rmw(ir.ATOMIC_OP.UMIN, i_ptr.handle, i_val.handle, and_(mask, neg, builder).handle, sem, scope), i_val.type)
     ret = where(pos, pos_ret, neg_ret, builder)
     return bitcast(ret, sca_ty, builder)
 
@@ -1165,9 +1187,11 @@ def atomic_min(ptr: tl.tensor,
                val: tl.tensor,
                mask: tl.tensor,
                sem: str,
+               scope: str,
                builder: ir.builder) -> tl.tensor:
     ptr, val, mask = atom_red_typechecking_impl(ptr, val, mask, 'min', builder)
     sem = _str_to_sem(sem)
+    scope = _str_to_scope(scope)
     sca_ty = val.type.scalar
     # direct call to atomic_min for integers
     if sca_ty.is_int():
@@ -1176,14 +1200,16 @@ def atomic_min(ptr: tl.tensor,
                                                        ptr.handle,
                                                        val.handle,
                                                        mask.handle,
-                                                       sem),
+                                                       sem,
+                                                       scope),
                              val.type)
         else:
             return tl.tensor(builder.create_atomic_rmw(ir.ATOMIC_OP.UMIN,
                                                        ptr.handle,
                                                        val.handle,
                                                        mask.handle,
-                                                       sem),
+                                                       sem,
+                                                       scope),
                              val.type)
     # for float
     # return atomic_smin(i_ptr, i_val) if val >= 0
@@ -1202,13 +1228,15 @@ def atomic_min(ptr: tl.tensor,
                                                   i_ptr.handle,
                                                   i_val.handle,
                                                   and_(mask, pos, builder).handle,
-                                                  sem),
+                                                  sem,
+                                                  scope),
                         i_val.type)
     neg_ret = tl.tensor(builder.create_atomic_rmw(ir.ATOMIC_OP.UMAX,
                                                   i_ptr.handle,
                                                   i_val.handle,
                                                   and_(mask, neg, builder).handle,
-                                                  sem),
+                                                  sem,
+                                                  scope),
                         i_val.type)
     ret = where(pos, pos_ret, neg_ret, builder)
     return bitcast(ret, sca_ty, builder)
@@ -1218,52 +1246,62 @@ def atomic_add(ptr: tl.tensor,
                val: tl.tensor,
                mask: tl.tensor,
                sem: str,
+               scope: str,
                builder: ir.builder) -> tl.tensor:
     ptr, val, mask = atom_red_typechecking_impl(ptr, val, mask, 'add', builder)
     sem = _str_to_sem(sem)
+    scope = _str_to_scope(scope)
     sca_ty = val.type.scalar
     op = ir.ATOMIC_OP.FADD if sca_ty.is_floating() else ir.ATOMIC_OP.ADD
-    return tl.tensor(builder.create_atomic_rmw(op, ptr.handle, val.handle, mask.handle, sem), val.type)
+    return tl.tensor(builder.create_atomic_rmw(op, ptr.handle, val.handle, mask.handle, sem, scope), val.type)
 
 
 def atomic_and(ptr: tl.tensor,
                val: tl.tensor,
                mask: tl.tensor,
                sem: str,
+               scope: str,
                builder: ir.builder) -> tl.tensor:
     ptr, val, mask = atom_red_typechecking_impl(ptr, val, mask, 'and', builder)
     sem = _str_to_sem(sem)
-    return tl.tensor(builder.create_atomic_rmw(ir.ATOMIC_OP.AND, ptr.handle, val.handle, mask.handle, sem), val.type)
+    scope = _str_to_scope(scope)
+    return tl.tensor(builder.create_atomic_rmw(ir.ATOMIC_OP.AND, ptr.handle, val.handle, mask.handle, sem, scope), val.type)
 
 
 def atomic_or(ptr: tl.tensor,
               val: tl.tensor,
               mask: tl.tensor,
               sem: str,
+              scope: str,
               builder: ir.builder) -> tl.tensor:
     ptr, val, mask = atom_red_typechecking_impl(ptr, val, mask, 'or', builder)
     sem = _str_to_sem(sem)
-    return tl.tensor(builder.create_atomic_rmw(ir.ATOMIC_OP.OR, ptr.handle, val.handle, mask.handle, sem), val.type)
+    scope = _str_to_scope(scope)
+    return tl.tensor(builder.create_atomic_rmw(ir.ATOMIC_OP.OR, ptr.handle, val.handle, mask.handle, sem, scope), val.type)
 
 
 def atomic_xor(ptr: tl.tensor,
                val: tl.tensor,
                mask: tl.tensor,
                sem: str,
+               scope: str,
                builder: ir.builder) -> tl.tensor:
     ptr, val, mask = atom_red_typechecking_impl(ptr, val, mask, 'xor', builder)
     sem = _str_to_sem(sem)
-    return tl.tensor(builder.create_atomic_rmw(ir.ATOMIC_OP.XOR, ptr.handle, val.handle, mask.handle, sem), val.type)
+    scope = _str_to_scope(scope)
+    return tl.tensor(builder.create_atomic_rmw(ir.ATOMIC_OP.XOR, ptr.handle, val.handle, mask.handle, sem, scope), val.type)
 
 
 def atomic_xchg(ptr: tl.tensor,
                 val: tl.tensor,
                 mask: tl.tensor,
                 sem: str,
+                scope: str,
                 builder: ir.builder) -> tl.tensor:
     ptr, val, mask = atom_red_typechecking_impl(ptr, val, mask, 'xchg', builder)
     sem = _str_to_sem(sem)
-    return tl.tensor(builder.create_atomic_rmw(ir.ATOMIC_OP.XCHG, ptr.handle, val.handle, mask.handle, sem), val.type)
+    scope = _str_to_scope(scope)
+    return tl.tensor(builder.create_atomic_rmw(ir.ATOMIC_OP.XCHG, ptr.handle, val.handle, mask.handle, sem, scope), val.type)
 
 # ===----------------------------------------------------------------------===//
 #                               Linear Algebra
@@ -1290,13 +1328,13 @@ def dot(lhs: tl.tensor,
         max_num_imprecise_acc: int,
         out_dtype: tl.dtype,
         builder: ir.builder) -> tl.tensor:
-    def assert_dtypes_valid(lhs_dtype, rhs_dtype, arch):
+    def assert_dtypes_valid(lhs_dtype, rhs_dtype, target):
         # Checks for non-cuda archs
-        if not _is_cuda(builder.arch):
+        if not _is_cuda(target):
             assert lhs_dtype == rhs_dtype, f"First input ({lhs_dtype}) and second input ({rhs_dtype}) must have the same dtype!"
             return
         # Checks for cuda arch
-        if arch < 90:
+        if target.capability < 90:
             assert not lhs_dtype.is_fp8e4nv() and not rhs_dtype.is_fp8e4nv(), "Dot op does not support fp8e4nv on CUDA arch < 90"
             if lhs_dtype.is_fp8() and rhs_dtype.is_fp8():
                 return
@@ -1317,7 +1355,7 @@ def dot(lhs: tl.tensor,
 
     assert lhs.type.is_block() and rhs.type.is_block()
 
-    assert_dtypes_valid(lhs.dtype, rhs.dtype, builder.arch)
+    assert_dtypes_valid(lhs.dtype, rhs.dtype, builder.target)
 
     assert len(lhs.shape) == 2, f"First input shape ({lhs.shape}) is not two dimensional!"
     assert len(rhs.shape) == 2, f"Second input shape ({rhs.shape}) is not two dimensional!"
@@ -1375,7 +1413,7 @@ def dot(lhs: tl.tensor,
         assert acc.type == ret_ty
 
     # max_num_imprecise_acc only applies to fp8 -> fp32 dot on sm_90
-    if not (_is_cuda(builder.arch) and builder.arch == 90 and lhs.dtype.is_fp8() and rhs.dtype.is_fp8() and ret_scalar_ty.is_fp32()):
+    if not (_is_cuda(builder.target) and builder.target.capability == 90 and lhs.dtype.is_fp8() and rhs.dtype.is_fp8() and ret_scalar_ty.is_fp32()):
         max_num_imprecise_acc = 0
     if max_num_imprecise_acc is None:
         max_num_imprecise_acc = 2**30
@@ -1575,6 +1613,15 @@ def debug_barrier(builder: ir.builder) -> tl.tensor:
 
 
 def device_print(prefix: str, args: List[tl.tensor], builder: ir.builder) -> tl.tensor:
+    # It makes sense visually for prefix to end in ": "; make it so.  Also,
+    # non-empty prefixes should start with " ".
+    if not prefix.endswith(" ") and args:
+        prefix += " "
+    if not prefix.endswith(": ") and args:
+        prefix = prefix[:-1] + ": "
+    if len(prefix) > 2 and not prefix.startswith(" "):
+        prefix = " " + prefix
+
     new_args = []
     for arg in args:
         new_args.append(arg.handle)

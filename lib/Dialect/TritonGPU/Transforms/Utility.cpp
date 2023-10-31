@@ -232,8 +232,10 @@ std::string GraphLayoutMarker::getColor(const Type &type) const {
       return "orange";
     else if (layout.isa<triton::gpu::SharedEncodingAttr>())
       return "orangered";
-    else
-      assert(0 && "Unrecognized layout");
+    else {
+      llvm::report_fatal_error("Unrecognized layout");
+      return "unknown";
+    }
   } else {
     return "white";
   }
@@ -342,8 +344,15 @@ bool canFoldIntoConversion(Operation *op, Attribute targetEncoding) {
     }
     return true;
   }
+  if (auto view = dyn_cast<triton::ViewOp>(op)) {
+    auto viewDstType = view.getType().cast<RankedTensorType>();
+    RankedTensorType newDstType = RankedTensorType::get(
+        viewDstType.getShape(), viewDstType.getElementType(), targetEncoding);
+    return !triton::gpu::isExpensiveView(view.getOperand().getType(),
+                                         newDstType);
+  }
   return isa<triton::gpu::ConvertLayoutOp, arith::ConstantOp,
-             triton::MakeRangeOp, triton::SplatOp, triton::ViewOp>(op);
+             triton::MakeRangeOp, triton::SplatOp>(op);
 }
 
 //
@@ -492,46 +501,6 @@ Value linearize(OpBuilder &b, Location loc, ArrayRef<Value> multiDim,
   return linear;
 }
 
-void getBackwardSliceSCFAware(Operation *op, SetVector<Operation *> *slices) {
-  SmallVector<Operation *> queue = {op};
-  while (!queue.empty()) {
-    Operation *currentOp = queue.back();
-    queue.pop_back();
-    SetVector<Operation *> temp;
-    auto filter = [slices](Operation *sliceOp) {
-      return slices->count(sliceOp) == 0;
-    };
-    mlir::getBackwardSlice(currentOp, &temp, filter);
-    for (Operation *sliceOp : temp) {
-      if (auto forOp = dyn_cast<scf::ForOp>(sliceOp)) {
-        queue.push_back(forOp.getBody()->getTerminator());
-      }
-    }
-    slices->insert(temp.begin(), temp.end());
-  }
-}
-
-void getForwardSliceSCFAware(Value root, SetVector<Operation *> *slices) {
-  SmallVector<Value> queue = {root};
-  while (!queue.empty()) {
-    Value currentValue = queue.back();
-    queue.pop_back();
-    SetVector<Operation *> temp;
-    auto filter = [slices](Operation *sliceOp) {
-      return slices->count(sliceOp) == 0;
-    };
-    mlir::getForwardSlice(currentValue, &temp, filter);
-    for (Operation *sliceOp : temp) {
-      if (auto yieldOp = dyn_cast<scf::YieldOp>(sliceOp)) {
-        auto forOp = yieldOp->getParentOfType<scf::ForOp>();
-        if (forOp)
-          queue.append(forOp->getResults().begin(), forOp->getResults().end());
-      }
-    }
-    slices->insert(temp.begin(), temp.end());
-  }
-}
-
 namespace {
 
 /// Detect dead arguments in scf.for op by assuming all the values are dead and
@@ -613,7 +582,7 @@ struct ForOpDeadArgElimination : public OpRewritePattern<scf::ForOp> {
         Value yieldOperand =
             forOwner.getBody()->getTerminator()->getOperand(iterIdx);
         markLive(yieldOperand);
-        markLive(forOwner.getIterOperands()[iterIdx]);
+        markLive(forOwner.getInitArgs()[iterIdx]);
       }
     }
     SmallVector<unsigned> deadArg;

@@ -10,10 +10,10 @@ from .jit import KernelInterface
 
 class OutOfResources(Exception):
     def __init__(self, required, limit, name):
-        self.message = f'out of resource: {name}, '\
-                       f'Required: {required}, '\
-                       f'Hardware limit: {limit}'
-        self.message += '. Reducing block sizes or `num_stages` may help.'
+        self.message = (
+            f"out of resource: {name}, Required: {required}, Hardware limit: {limit}. "
+            + "Reducing block sizes or `num_stages` may help."
+        )
         self.required = required
         self.limit = limit
         self.name = name
@@ -26,12 +26,12 @@ class OutOfResources(Exception):
 
 class Autotuner(KernelInterface):
     def __init__(self, fn, arg_names, configs, key, reset_to_zero, prune_configs_by: Dict = None, warmup=25, rep=100):
-        '''
+        """
         :param prune_configs_by: a dict of functions that are used to prune configs, fields:
             'perf_model': performance model used to predicate running time with different configs, returns running time
             'top_k': number of configs to bench
             'prune_num_stages_by'(optional): a function used to prune num_stages. It takes configs:List[Config] as its input, and returns pruned configs.
-        '''
+        """
         if not configs:
             self.configs = [Config({}, num_warps=4, num_stages=2, num_ctas=1)]
         else:
@@ -46,13 +46,14 @@ class Autotuner(KernelInterface):
             def _hook(args):
                 for i in self.reset_idx:
                     args[i].zero_()
+
             self.hook = _hook
         self.arg_names = arg_names
         # prune configs
         if prune_configs_by:
-            perf_model, top_k = prune_configs_by['perf_model'], prune_configs_by['top_k']
-            if 'early_config_prune' in prune_configs_by:
-                early_config_prune = prune_configs_by['early_config_prune']
+            perf_model, top_k = prune_configs_by["perf_model"], prune_configs_by["top_k"]
+            if "early_config_prune" in prune_configs_by:
+                early_config_prune = prune_configs_by["early_config_prune"]
         else:
             perf_model, top_k, early_config_prune = None, None, None
         self.perf_model, self.configs_top_k = perf_model, top_k
@@ -78,15 +79,20 @@ class Autotuner(KernelInterface):
             if config.pre_hook:
                 config.pre_hook(full_nargs)
             self.hook(args)
-            self.fn.run(*args, num_warps=config.num_warps, num_stages=config.num_stages,
-                        num_ctas=config.num_ctas,
-                        enable_warp_specialization=config.enable_warp_specialization,
-                        # enable_persistent=False,
-                        **current)
+            self.fn.run(
+                *args,
+                num_warps=config.num_warps,
+                num_stages=config.num_stages,
+                num_ctas=config.num_ctas,
+                enable_warp_specialization=config.enable_warp_specialization,
+                # enable_persistent=False,
+                **current,
+            )
+
         try:
             return do_bench(kernel_call, warmup=self.warmup, rep=self.rep, quantiles=(0.5, 0.2, 0.8))
         except OutOfResources:
-            return [float('inf'), float('inf'), float('inf')]
+            return [float("inf"), float("inf"), float("inf")]
 
     def run(self, *args, **kwargs):
         self.nargs = dict(zip(self.arg_names, args))
@@ -97,14 +103,17 @@ class Autotuner(KernelInterface):
             for name in self.arg_names:
                 if name in all_args:
                     _args.append(all_args[name])
-            key = tuple(_args[i] for i in self.key_idx)
+            key = [_args[i] for i in self.key_idx]
+            for arg in _args:
+                if hasattr(arg, "dtype"):
+                    key.append(str(arg.dtype))
+            key = tuple(key)
             if key not in self.cache:
                 # prune configs
                 pruned_configs = self.prune_configs(kwargs)
                 assert len(pruned_configs) != 0, "pruned_configs == 0, no Valid config"
                 bench_start = time.time()
-                timings = {config: self._bench(*args, config=config, **kwargs)
-                           for config in pruned_configs}
+                timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
                 bench_end = time.time()
                 sorted_configs = sorted(timings.keys(), key=lambda x: timings[x][1])
                 number_top = 1
@@ -134,9 +143,15 @@ class Autotuner(KernelInterface):
         full_nargs = {**self.nargs, **kwargs, **self.best_config.kwargs}
         if config.pre_hook is not None:
             config.pre_hook(full_nargs)
-        ret = self.fn.run(*args, num_warps=config.num_warps, num_stages=config.num_stages,
-                          num_ctas=config.num_ctas,
-                          enable_warp_specialization=config.enable_warp_specialization, **kwargs, **config.kwargs)
+        ret = self.fn.run(
+            *args,
+            num_warps=config.num_warps,
+            num_stages=config.num_stages,
+            num_ctas=config.num_ctas,
+            enable_warp_specialization=config.enable_warp_specialization,
+            **kwargs,
+            **config.kwargs,
+        )
         self.nargs = None
         return ret
 
@@ -150,17 +165,19 @@ class Autotuner(KernelInterface):
                 top_k = int(len(self.configs) * top_k)
             if len(pruned_configs) > top_k:
                 est_timing = {
-                    config: self.perf_model(**self.nargs, **kwargs, **config.kwargs, num_stages=config.num_stages,
-                                            num_warps=config.num_warps,
-                                            num_ctas=config.num_ctas,
-                                            enable_warp_specialization=config.enable_warp_specialization,
-                                            enable_persistent=config.enable_persistent)
+                    config: self.perf_model(
+                        **self.nargs,
+                        **kwargs,
+                        **config.kwargs,
+                        num_stages=config.num_stages,
+                        num_warps=config.num_warps,
+                        num_ctas=config.num_ctas,
+                        enable_warp_specialization=config.enable_warp_specialization,
+                        enable_persistent=config.enable_persistent,
+                    )
                     for config in pruned_configs
                 }
-                pruned_configs = sorted(
-                    est_timing.keys(),
-                    key=lambda x: est_timing[x])[
-                    :top_k]
+                pruned_configs = sorted(est_timing.keys(), key=lambda x: est_timing[x])[:top_k]
         return pruned_configs
 
     def warmup(self, *args, **kwargs):
@@ -210,14 +227,13 @@ class Config:
     def __str__(self):
         res = []
         for k, v in self.kwargs.items():
-            res.append(f'{k}: {v}')
-        res.append(f'num_warps: {self.num_warps}')
-        res.append(f'num_ctas: {self.num_ctas}')
-        res.append(f'num_stages: {self.num_stages}')
-        res.append(
-            f'enable_warp_specialization: {self.enable_warp_specialization}')
-        res.append(f'enable_persistent: {self.enable_persistent}')
-        return ', '.join(res)
+            res.append(f"{k}: {v}")
+        res.append(f"num_warps: {self.num_warps}")
+        res.append(f"num_ctas: {self.num_ctas}")
+        res.append(f"num_stages: {self.num_stages}")
+        res.append(f"enable_warp_specialization: {self.enable_warp_specialization}")
+        res.append(f"enable_persistent: {self.enable_persistent}")
+        return ", ".join(res)
 
 
 def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, warmup=25, rep=100):
@@ -256,6 +272,7 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, warmup=25,
     :param rep: Repetition time (in ms) to pass to benchmarking, defaults to 100.
     :type rep: int
     """
+
     def decorator(fn):
         return Autotuner(fn, fn.arg_names, configs, key, reset_to_zero, prune_configs_by, warmup, rep)
 
@@ -263,7 +280,6 @@ def autotune(configs, key, prune_configs_by=None, reset_to_zero=None, warmup=25,
 
 
 class Heuristics(KernelInterface):
-
     def __init__(self, fn, arg_names, values) -> None:
         self.fn = fn
         self.values = values
@@ -291,6 +307,7 @@ def heuristics(values):
                    each such function takes a list of positional arguments as input.
     :type values: dict[str, Callable[[list[Any]], Any]]
     """
+
     def decorator(fn):
         return Heuristics(fn, fn.arg_names, values)
 

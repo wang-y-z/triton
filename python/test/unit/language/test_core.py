@@ -20,6 +20,7 @@ uint_dtypes = ['uint8', 'uint16', 'uint32', 'uint64']
 float_dtypes = ['float16', 'float32', 'float64']
 dtypes = int_dtypes + uint_dtypes + float_dtypes
 dtypes_with_bfloat16 = dtypes + ['bfloat16']
+torch_float8_dtypes = ['float8_e4m3fn', 'float8_e5m2']
 torch_dtypes = ['bool'] + int_dtypes + ['uint8'] + float_dtypes + ['bfloat16']
 
 # TODO: enable multiple cta cluster testing.
@@ -131,7 +132,7 @@ def check_type_supported(dtype, device):
         cc = torch.cuda.get_device_capability()
         if cc[0] < 8 and (dtype is tl.bfloat16 or dtype == "bfloat16" or dtype is torch.bfloat16):
             pytest.skip("bfloat16 is only supported on NVGPU with cc >= 80")
-        if cc[0] < 9 and (dtype is tl.float8e4nv or dtype == "float8e4nv"):
+        if cc[0] < 9 and dtype in {tl.float8e4nv, "float8e4nv", "float8_e4m3fn"}:
             pytest.skip("float8e4nv is only supported on NVGPU with cc >= 90")
 
 
@@ -859,9 +860,9 @@ def test_unary_op(dtype_x, expr, num_ctas, device):
 # ----------------
 
 
-@pytest.mark.parametrize("dtype_x, expr", [(dtype_x, expr) for dtype_x in ["float32", "float64"] for expr in ['exp', 'log', 'cos', 'sin']])
-def test_math_op(dtype_x, expr, device):
-    _test_unary(dtype_x, f'tl.{expr}(x)', f'np.{expr}(x) ', device=device)
+@pytest.mark.parametrize("dtype_x, expr, x", [(dtype_x, expr, x) for dtype_x in ["float32", "float64"] for expr in ['exp', 'log', 'cos', 'sin'] for x in ['x', '3.0']])
+def test_math_op(dtype_x, expr, device, x):
+    _test_unary(dtype_x, f'tl.{expr}({x})', f'np.{expr}({x}) ', device=device)
 
 # ----------------
 # test abs
@@ -1276,28 +1277,57 @@ def test_atomic_cas(sem, num_ctas, device):
     assert f"atom.global.{sem_str}" in h.asm["ptx"]
 
 
+@pytest.mark.parametrize("sem", [None, 'acquire', 'release', 'acq_rel', 'relaxed'])
+@pytest.mark.parametrize("num_ctas", num_ctas_list)
+def test_tensor_atomic_cas(sem, num_ctas, device):
+    @triton.jit
+    def change_value(X, BLOCK_SIZE: tl.constexpr):
+        pid = tl.program_id(axis=0)
+        block_start = pid * BLOCK_SIZE
+        offsets = block_start + tl.arange(0, BLOCK_SIZE)
+        t1 = tl.full((BLOCK_SIZE, ), 0, dtype=tl.int64)
+        t2 = tl.full((BLOCK_SIZE, ), 2, dtype=tl.int64)
+        tl.atomic_cas(X + offsets, t1, t2)
+
+    X = torch.tensor([0, 1, 0, 1, 0, 1, 0, 1], device=device, dtype=torch.int64)
+    Y = torch.tensor([2, 1, 2, 1, 2, 1, 2, 1], device=device, dtype=torch.int64)
+
+    change_value[(2,)](X, 4)
+    assert (torch.equal(X, Y))
+
+
 # ---------------
 # test cast
 # ---------------
 
 
-@pytest.mark.parametrize("dtype_x, dtype_z, bitcast", [
-    (dtype_x, dtype_z, False)
+@pytest.mark.parametrize("dtype_x, dtype_z, bitcast, size", [
+    (dtype_x, dtype_z, False, 1024)
     for dtype_x in dtypes
     for dtype_z in dtypes
 ] + [
-    ('float32', 'bfloat16', False),
-    ('bfloat16', 'float32', False),
-    ('float32', 'int32', True),
-    ('float32', 'int1', False),
-    ('int8', 'bfloat16', False),
+    ('float32', 'bfloat16', False, 1024),
+    ('bfloat16', 'float32', False, 1024),
+    ('float32', 'int32', True, 1024),
+    ('float32', 'int1', False, 1024),
+    ('int8', 'bfloat16', False, 1024),
 ] + [
-    (f'uint{x}', f'int{x}', True) for x in [8, 16, 32, 64]
+    (f'uint{x}', f'int{x}', True, 1024) for x in [8, 16, 32, 64]
 ] + [
-    (f'int{x}', f'uint{x}', True) for x in [8, 16, 32, 64]
-])
+    (f'int{x}', f'uint{x}', True, 1024) for x in [8, 16, 32, 64]
+] + (([
+    (dtype_x, dtype_z, False, size)
+    for dtype_x in torch_float8_dtypes
+    for dtype_z in ["float16", "float32", "bfloat16"]
+    for size in [1024, 32]
+] + [
+    (dtype_x, dtype_z, False, size)
+    for dtype_z in torch_float8_dtypes
+    for dtype_x in ["float16", "float32", "bfloat16"]
+    for size in [1024, 32]
+]) if torch.__version__ >= "2.1" else []))
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
-def test_cast(dtype_x, dtype_z, bitcast, num_ctas, device):
+def test_cast(dtype_x, dtype_z, bitcast, size, num_ctas, device):
     # bfloat16 on cc < 80 will not be tested
     check_type_supported(dtype_x, device)
     check_type_supported(dtype_z, device)
@@ -1305,10 +1335,11 @@ def test_cast(dtype_x, dtype_z, bitcast, num_ctas, device):
     if is_hip() and (dtype_z == "bfloat16"):
         pytest.skip(f'test_cast{(dtype_x, dtype_z)} cast to bfloat16 not supported on HIP.')
 
-    size = 1024
     # This is tricky because numpy doesn't have bfloat, and torch doesn't have uints.
     if dtype_x.startswith('bfloat'):
         x_tri = torch.randn(size, dtype=getattr(torch, dtype_x), device=device)
+    elif dtype_x.startswith('float8'):
+        x_tri = torch.randn(size, dtype=torch.half, device=device).to(dtype=getattr(torch, dtype_x))
     else:
         x = numpy_random(size, dtype_str=dtype_x, low=-10, high=10) * 10
         # Triton clamps negative values to zero, while numpy wraps around
@@ -1317,8 +1348,11 @@ def test_cast(dtype_x, dtype_z, bitcast, num_ctas, device):
         if dtype_z in uint_dtypes:
             x = np.absolute(x)
         x_tri = to_triton(x, device=device)
-
+    if 'float' in dtype_z and 'float' in dtype_x:
+        # make sure we use values that can be represented in both types
+        x_tri = x_tri.to(getattr(torch, dtype_z)).to(getattr(torch, dtype_x))
     # triton kernel
+
     @triton.jit
     def kernel(X, Z, BITCAST: tl.constexpr, SIZE: tl.constexpr):
         x_ptr = X + tl.arange(0, SIZE)
@@ -1331,11 +1365,13 @@ def test_cast(dtype_x, dtype_z, bitcast, num_ctas, device):
     # triton result
     if dtype_z.startswith('bfloat'):
         z_tri = torch.empty((size,), dtype=getattr(torch, dtype_z), device=device)
+    elif dtype_z.startswith('float8'):
+        z_tri = torch.empty((size,), dtype=torch.half, device=device).to(dtype=getattr(torch, dtype_z))
     else:
         z_tri = to_triton(np.empty((size, ), dtype=getattr(np, dtype_z_np)), device=device)
     kernel[(1, )](x_tri, z_tri, BITCAST=bitcast, SIZE=size, num_warps=1, num_ctas=num_ctas)
     # torch result
-    if dtype_z.startswith('bfloat') or dtype_x.startswith('bfloat'):
+    if dtype_z.startswith('bfloat') or dtype_x.startswith('bfloat') or dtype_z.startswith('float8') or dtype_x.startswith('float8'):
         assert bitcast is False
         z_ref = x_tri.to(z_tri.dtype)
         torch.testing.assert_close(z_ref, z_tri, rtol=0, atol=0)
@@ -1512,22 +1548,26 @@ def test_fp8_fpN_roundtrip(in_dtype, out_dtype, device):
 
     # initialize array containing all possible f8 values except NaN
     ref_fp8 = np.array(range(-128, 128), dtype=np.int8)
-    is_nan = (ref_fp8 & 0b01111100) == 128 - 2**in_dtype.fp_mantissa_width
     exp_mask = 0b01111111 ^ ((1 << in_dtype.fp_mantissa_width) - 1)
+    is_nan = (ref_fp8 & 0b01111100) == 128 - 2**in_dtype.fp_mantissa_width
     is_subnormal = np.logical_or((ref_fp8 & exp_mask) == 0, (ref_fp8 & exp_mask) == exp_mask)
-    ref_fp8[is_nan] = 0
-    ref_fp8[is_subnormal] = 0
     tri_fp8 = torch.from_numpy(serialize_fp8(ref_fp8, in_dtype)).cuda()
+    # check that non-subnormal fp8 are correctly converted to fp16
     tri_fp16 = torch.empty(256, dtype=out_dtype, device="cuda")
     copy_kernel[(1,)](triton.reinterpret(tri_fp8, in_dtype), tri_fp16, tri_fp16.shape[0], BLOCK_SIZE=1024)
-
     ref_fp8 = torch.from_numpy(ref_fp8).cuda()
     ref_fp16 = convert_float_to_float32(ref_fp8, in_dtype)
     assert torch.all(tri_fp16[~is_subnormal] == ref_fp16[~is_subnormal])
-
+    # check that values are properly converted back to float8
     ref_fp8 = torch.empty_like(tri_fp16, dtype=torch.int8)
     copy_kernel[(1,)](tri_fp16, triton.reinterpret(ref_fp8, in_dtype), tri_fp16.shape[0], BLOCK_SIZE=1024)
-    assert torch.all(tri_fp8 == ref_fp8)
+    if in_dtype == tl.float8e4b15:
+        assert torch.all(tri_fp8[:127] == ref_fp8[:127])
+        assert torch.all(tri_fp8[128:255] == ref_fp8[128:255])
+        assert ref_fp8[126] == ref_fp8[127]  # -1.875 saturates to -1.75
+        assert ref_fp8[254] == ref_fp8[255]  # 1.875 saturates to  1.75
+    else:
+        assert torch.all(tri_fp8[~is_subnormal] == ref_fp8[~is_subnormal])
 
 # ---------------
 # test reduce
@@ -1643,10 +1683,18 @@ reduce_configs2 = [
     for op in ['min', 'max', 'sum']
 ]
 
+reduce3d_shapes = [(2, 32, 16), (32, 2, 16), (32, 16, 2)]
+reduce_configs3 = [
+    (op, 'float32', shape, axis)
+    for op in ['min', 'max', 'sum', 'argmin', 'argmax']
+    for shape in reduce3d_shapes
+    for axis in [0, 1, 2]
+]
 
-@pytest.mark.parametrize("op, dtype_str, shape, axis", reduce_configs1 + reduce_configs2)
+
+@pytest.mark.parametrize("op, dtype_str, shape, axis", reduce_configs1 + reduce_configs2 + reduce_configs3)
 @pytest.mark.parametrize("num_ctas", num_ctas_list)
-def test_reduce2d(op, dtype_str, shape, axis, num_ctas, device):
+def test_reduce(op, dtype_str, shape, axis, num_ctas, device):
     check_type_supported(dtype_str, device)  # bfloat16 on cc < 80 will not be tested
 
     if is_hip():
@@ -1654,17 +1702,31 @@ def test_reduce2d(op, dtype_str, shape, axis, num_ctas, device):
     # triton kernel
 
     @triton.jit
-    def kernel(X, Z, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, AXIS: tl.constexpr):
+    def kernel(X, Z, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, IS_3D: tl.constexpr, AXIS: tl.constexpr):
         range_m = tl.arange(0, BLOCK_M)
         range_n = tl.arange(0, BLOCK_N)
-        x = tl.load(X + range_m[:, None] * BLOCK_N + range_n[None, :])
-        z = GENERATE_TEST_HERE
-        if AXIS is None:
-            tl.store(Z, z)
-        elif AXIS == 1:
-            tl.store(Z + range_m, z)
+        range_k = tl.arange(0, BLOCK_K)
+        if IS_3D:
+            x = tl.load(X + range_m[:, None, None] * BLOCK_N * BLOCK_K + range_n[None, :, None] * BLOCK_K + range_k[None, None, :])
         else:
-            tl.store(Z + range_n, z)
+            x = tl.load(X + range_m[:, None] * BLOCK_N + range_n[None, :])
+        z = GENERATE_TEST_HERE
+        if IS_3D:
+            if AXIS is None:
+                tl.store(Z, z)
+            elif AXIS == 0:
+                tl.store(Z + range_n[:, None] * BLOCK_K + range_k[None, :], z)
+            elif AXIS == 1:
+                tl.store(Z + range_m[:, None] * BLOCK_K + range_k[None, :], z)
+            else:
+                tl.store(Z + range_m[:, None] * BLOCK_N + range_n[None, :], z)
+        else:
+            if AXIS is None:
+                tl.store(Z, z)
+            elif AXIS == 0:
+                tl.store(Z + range_n, z)
+            else:
+                tl.store(Z + range_m, z)
 
     kernel = patch_kernel(kernel, {'GENERATE_TEST_HERE': f'tl.{op}(x, axis=AXIS)'})
     # input
@@ -1687,10 +1749,13 @@ def test_reduce2d(op, dtype_str, shape, axis, num_ctas, device):
         z_ref = numpy_op(x, axis=axis).astype(getattr(np, z_dtype_str))
     # triton result
     ret_numel = 1 if axis is None else shape[1 - axis]
-    z_tri = to_triton(numpy_random((ret_numel,), dtype_str=z_dtype_str, rs=rs),
+    z_shape = (1,) if axis is None else tuple(shape_i for i, shape_i in enumerate(shape) if i != axis)
+    z_tri = to_triton(numpy_random(z_shape, dtype_str=z_dtype_str, rs=rs),
                       device=device, dst_type=z_tri_dtype_str)
+    BLOCK_K = 1 if len(shape) == 2 else shape[2]
+    IS_3D = bool(len(shape) == 3)
     kernel[(1,)](x_tri, z_tri, BLOCK_M=shape[0],
-                 BLOCK_N=shape[1], AXIS=axis, num_ctas=num_ctas)
+                 BLOCK_N=shape[1], BLOCK_K=BLOCK_K, IS_3D=IS_3D, AXIS=axis, num_ctas=num_ctas)
     z_tri = to_numpy(z_tri)
     # compare
     if op == 'sum':
@@ -1871,7 +1936,7 @@ def test_reduce_layouts(M, N, src_layout, axis, reduce2d, dtype_str, reduce_op, 
 
     ty = {"int32": "i32", "float32": "f32", "float16": "f16"}[dtype_str]
     arith_op = {
-        "max": {"int32": "arith.maxsi", "float32": "arith.maxf", "float16": "arith.maxf"},
+        "max": {"int32": "arith.maxsi", "float32": "arith.maximumf", "float16": "arith.maximumf"},
         "sum": {"int32": "arith.addi", "float32": "arith.addf", "float16": "arith.addf"}
     }[reduce_op][dtype_str]
     numpy_op = {
@@ -2085,7 +2150,7 @@ def test_chain_reduce(M, N, src_layout, op, device, first_axis):
         tt.reduce.return %13 : i32"""
     elif op == "max":
         op_str = f"""
-        %13 = "{GPU_DIALECT}.cmpi"(%arg2, %arg3) <{{predicate = 4 : i64}}> : (i32, i32) -> i1
+        %13 = arith.cmpi "sgt", %arg2, %arg3 : i32
         %14 = arith.select %13, %arg2, %arg3 : i32
         tt.reduce.return %14 : i32"""
     ir = f"""
@@ -2419,11 +2484,10 @@ def test_dot(M, N, K, num_warps, col_a, col_b, epilogue, allow_tf32, in_dtype, o
             red_code = ptx[start:end]
             assert len(red_code) > 0
             import os
-            enable_mmav3 = os.environ.get('ENABLE_MMA_V3', 'not found').lower()
-            enable_tma = os.environ.get('ENABLE_TMA', 'not found').lower()
+
             # skip this check on hopper because there are some functions whose name contain "shared" in ptx.
             # TODO: we should eliminate these unused functions in ptx code.
-            if not (enable_mmav3 in ["on", "true", "1"] and enable_tma in ["on", "true", "1"]):
+            if not (capability[0] >= 9):
                 assert "shared" not in red_code
             assert "bar.sync" not in red_code
     # torch result
@@ -2526,13 +2590,12 @@ def test_dot_mulbroadcastred(in_dtype, device):
     if is_hip():
         return
     assert "tt.dot" in h.asm['ttir']
-    # with option ENABLE_MMA_V3 on, we will not pipeline the load op for Y
+    # when using MMAv3, we will not pipeline the load op for Y
     # as the loaded value is in rowmajor. But MMAv3 requires it's second
     # operand is in colmajor because transpose is not supported for MMAv3
     # with float32 input.
     import os
-    enable_mmav3 = os.environ.get('ENABLE_MMA_V3', 'not found').lower()
-    if enable_mmav3 in ["on", "true", "1"]:
+    if capability[0] >= 9:
         assert "triton_gpu.async_wait {num = 1 : i32}" in h.asm['ttgir']
     else:
         assert "triton_gpu.async_wait {num = 2 : i32}" in h.asm['ttgir']
@@ -3032,6 +3095,20 @@ def test_constexpr_scalar_shape(device):
     kernel[(1,)](x_tri, 32)
     np.testing.assert_equal(to_numpy(x_tri), np.arange(0, 256) % 8)
 
+
+@triton.jit
+def static_assert_func():
+    tl.static_assert(tl.constexpr(False), f"Assert is firing because the constexpr progation did not work properly")
+
+
+def test_constexpr_propagation():
+    @triton.jit
+    def _kernel(COND: tl.constexpr):
+        NEW_COND = COND
+        if NEW_COND:
+            static_assert_func()
+    _kernel[(1,)](False)
+
 # -------------
 # test call
 # -------------
@@ -3080,7 +3157,7 @@ def test_call(type, num_ctas, device):
         err_msg = str(e)
 
     if type == "noinline":
-        assert err_msg is not ""
+        assert err_msg != ""
     else:
         ans = rand_val * 1 * 2 * 1 * 2 * 3 * 4
         np.testing.assert_equal(to_numpy(rand_val_tri), ans)
@@ -3100,16 +3177,16 @@ def test_if(if_type, device):
         pid = tl.program_id(0)
         cond = tl.load(Cond)
         if IfType == "if":
-            if pid % 2 == 0:
+            if pid % 2 == 0:  # eq
                 tl.store(Ret, tl.load(XTrue))
-            else:
+            elif 1 == pid % 2:  # req
                 tl.store(Ret, tl.load(XFalse))
         elif IfType == "if_exp_dynamic":
             tl.store(Ret, tl.load(XTrue)) if pid % 2 == 0 else tl.store(Ret, tl.load(XFalse))
         elif IfType == "if_exp_static":
             tl.store(Ret, tl.load(XTrue)) if BoolVar else tl.store(Ret, tl.load(XFalse))
         elif IfType == "if_and_dynamic":
-            if BoolVar and pid % 2 == 0:
+            if BoolVar and (1 != pid % 2 and pid % 2 != 1):  # rne and ne
                 tl.store(Ret, tl.load(XTrue))
             else:
                 tl.store(Ret, tl.load(XFalse))
@@ -3587,6 +3664,22 @@ def test_while(device):
 # test extra
 # -----------------------
 
+def test_num_threads(device):
+    if is_hip():
+        pytest.skip("test_num_threads is not supported in HIP")
+    check_cuda_only(device)
+
+    @triton.jit
+    def kernel(Out):
+        num_threads: tl.constexpr = tl.extra.cuda.num_threads()
+        offs = tl.arange(0, num_threads)
+        tl.store(Out + offs, 1)
+
+    num_threads = 256
+    out = to_triton(np.zeros((num_threads,), dtype=np.int32), device=device)
+    kernel[(1,)](out, num_warps=num_threads // 32)
+    assert torch.sum(out) == 256
+
 
 def test_globaltimer(device):
     if is_hip():
@@ -3860,3 +3953,22 @@ def test_fp8_dot_acc(in_type_str, low_precision_acc, device):
         torch.testing.assert_close(ref_out, C, rtol=1e-3, atol=1e-3)
     else:
         torch.testing.assert_close(ref_out, C)
+
+# -----------------------
+# test enable_fp_fusion
+# -----------------------
+
+
+@pytest.mark.parametrize("enable_fp_fusion", [False, True])
+def test_enable_fp_fusion(enable_fp_fusion):
+    # Sequential multiply add can be fused by backend
+    @triton.jit
+    def mul_add(data):
+        ptrs = data + tl.arange(0, 128)
+        tl.store(ptrs, tl.load(ptrs) * 1.5 + 1.0)
+
+    data = torch.randn((128,), device='cuda', dtype=torch.float32)
+    h = mul_add[(1,)](data, enable_fp_fusion=enable_fp_fusion)
+
+    found_fma = re.search(r'(mad|fma)\.r[nzmp]\.(ftz\.)?f32', h.asm["ptx"]) is not None
+    assert found_fma == enable_fp_fusion
